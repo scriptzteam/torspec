@@ -4,6 +4,22 @@
 This file lists the recognized parameters that can appear on the "params"
 line of a directory consensus.
 
+Table of Contents
+
+    1. Network protocol parameters
+    2. Performance-tuning parameters
+    3. Voting-related parameters
+    4. Circuit-build-timeout parameters
+    5. Directory-related parameters
+    6. Pathbias parameters
+    7. Relay behavior
+    8. V3 onion service parameters
+    9. Denial-of-service parameters
+    10. Padding-related parameters
+    11. Guard-related parameters
+    12. Relay behavior
+    X. Obsolete parameters
+
 1. Network protocol parameters
 
     "circwindow" -- the default package window that circuits should be
@@ -67,7 +83,7 @@ line of a directory consensus.
 
     "perconnbwrate" and "perconnbwburst" -- if set, each relay sets up a
     separate token bucket for every client OR connection, and rate limits
-    that connection indepedently. Typically left unset, except when used for
+    that connection independently. Typically left unset, except when used for
     performance experiments around trac entry 1750. Only honored by relays
     running Tor 0.2.2.16-alpha and later. (Note that relays running
     0.2.2.7-alpha through 0.2.2.14-alpha looked for bwconnrate and
@@ -308,7 +324,7 @@ line of a directory consensus.
     Min: 0. Max: 1. Default: 0.
     First appeared: 0.2.6
 
-    "guard-lifetime-days" -- Controls guard lifetime. If a unconfirmed
+    "guard-lifetime-days" -- Controls guard lifetime. If an unconfirmed
     guard has been sampled more than this many days ago, it should be
     removed from the guard sample.
     Min: 1. Max: 3650. Default: 120.
@@ -347,8 +363,9 @@ line of a directory consensus.
     "guard-extreme-restriction-percent" -- Warn the user if they have
     configured tor to exclude so many guards that the available guard
     bandwidth is less than this percentage of the total.
-    Min: 1. Max: INT32_MAX. Default: 1.
-    First appeared: 0.3.0
+    Min: 1. Max: 100. Default: 1.
+    First appeared: 0.3.0.  MAX was INT32_MAX, which would have no meaningful
+    effect.  MAX lowered to 100 in 0.4.7.
 
     "guard-min-filtered-sample-size" -- If fewer than this number of
     guards is available in the sample after filtering out unusable
@@ -378,7 +395,7 @@ line of a directory consensus.
     Min: 1. Max: INT32_MAX. Default: 15
     First appeared: 0.3.0
 
-    "guard-nonprimary-guard-idle-timeout" --  When trying to confirm
+    "guard-nonprimary-guard-idle-timeout" -- When trying to confirm
     nonprimary guards, if a guard doesn't answer for more than this long
     in seconds, treat it as down.
     Min: 1. Max: INT32_MAX. Default: 600

@@ -120,11 +120,42 @@ and the arrival of the SENDME command that the other endpoint
 immediately sends to ack that 100th cell.
 
 Circuits will record the current RTT measurement as a field in their
-circuit_t data structure. They will also record the minimum and maximum
-RTT seen so far.
+circuit_t data structure. The current RTT is N-EWMA smoothed[27] over a
+'cc_ewma_cwnd_cnt' multiple of congestion window worth of sendme acks.
+
+Circuits will also record the minimum and maximum RTT seen so far.
 
 Algorithms that make use of this RTT measurement for congestion
 window update are specified in [CONTROL_ALGORITHMS].
+
+2.1.1. Clock Jump Heuristics [CLOCK_HEURISTICS]
+
+The timestamps for RTT (and BDP) are measured using Tor's
+monotime_absolute_usec() API. This API is designed to provide a monotonic
+clock that only moves forward. However, depending on the underlying system
+clock, this may result in the same timestamp value being returned for long
+periods of time, which would result in RTT 0-values. Alternatively, the clock
+may jump forward, resulting in abnormally large RTT values.
+
+To guard against this, we perform a series of heuristic checks on the time delta
+measured by the RTT estimator, and if these heurtics detect a stall or a jump,
+we do not use that value to update RTT or BDP, nor do we update any congestion
+control algorithm information that round.
+
+If the time delta is 0, that is always treated as a clock stall.
+
+If we have measured at least 'cc_bwe_min' RTT values or we have successfully
+exited slow start, then every sendme ACK, the new candidate RTT is compared to
+the stored EWMA RTT. If the new RTT is either 100 times larger than the EWMA
+RTT, or 100 times smaller than the stored EWMA RTT, then we do not record that
+estimate, and do not update BDP or the congestion control algorithms for that
+SENDME ack.
+
+Moreover, if a clock stall is detected by *any* circuit, this fact is
+cached, and this cached value is used on circuits for which we do not
+have enough data to compute the above heueristics. This cached value is
+also exported for use by the edge connection rate calculations done by
+[XON_ADVISORY].
 
 2.2. SENDME behavior changes
 
@@ -137,7 +168,7 @@ algorithm mechanisms.  We will need a similar announcement in the onion
 service descriptors of services that support congestion control.
 
 Second, we will turn CIRCWINDOW_INCREMENT into a consensus parameter
-'circwindow_inc', instead of using a hardcoded value of 100 cells. It is
+cc_sendme_inc, instead of using a hardcoded value of 100 cells. It is
 likely that more frequent SENDME cells will provide quicker reaction to
 congestion, since the RTT will be measured more often. If
 experimentation in Shadow shows that more frequent SENDMEs reduce
@@ -145,26 +176,8 @@ congestion and improve performance but add significant overhead, we can
 reduce SENDME overhead by allowing SENDME cells to carry stream data, as
 well, using Proposal 325.
 
-  TODO: If two endpoints view different consensus parameters for
-        'circwindow_inc', we will have complications measuring RTT,
-        as well as complications for authenticated SENDME hash
-        accounting. We need a way for endpoints to negotiate SENDME
-        pacing with eachother, perhaps during circuit setup. This will
-        require changes to the Onionskin/CREATE cell format (and
-        RELAY_COMMAND_EXTEND), as mentioned in Section [PROTOCOL_SPEC].
-        This could be accomplished via hs-ntor's handshake, which
-        allows extra data fields in the circuit handshake.
-
-  TODO: circwindow_inc's rate of change could be capped for safety
-
-  TODO: As an optimization, 'circwindow_inc' could change as a function
-        of slow start vs AIMD.
-
-Second, all end-to-end relay cells except RELAY_COMMAND_DROP and SENDME
-itself will count towards SENDME cell counts. The details behind how these
-cells are handled is addressed in section [SYSTEM_INTERACTIONS].
-
-   TODO: List any other exceptions. There probably are some more.
+  TODO: Refer to or include final version of the negotiation proposal for
+  this: https://gitlab.torproject.org/tpo/core/tor/-/issues/40377
 
 Third, authenticated SENDMEs can remain as-is in terms of protocol
 behavior, but will require some implementation updates to account for
@@ -184,14 +197,24 @@ streams and backpressure is covered in [FLOW_CONTROL].
 
 3. Congestion Window Update Algorithms [CONTROL_ALGORITHMS]
 
-We specify two candidate window update algorithms. The specification
-describes the update algorithms for the slow start phase and the
-steady state phase separately, with some explanation. Then the
-combined algorithm is given.
+In general, the goal of congestion control is to ensure full and fair
+utilization of the capacity of a network path -- in the case of Tor the spare
+capacity of the circuit. This is accomplished by setting the congestion window
+to target the Bandwidth-Delay Product[28] (BDP) of the circuit in one way or
+another, so that the total data outstanding is roughly equal to the actual
+transit capacity of the circuit.
 
-Note that these algorithms differ slightly from the background tor-dev
-mails[1,2], due to corrections and improvements. Hence they have been
-given different names than in those two mails.
+There are several ways to update a congestion window to target the BDP. Some
+use direct BDP estimation, where as others use backoff properties to achieve
+this. We specify three BDP estimation algorithms in the [BDP_ESTIMATION]
+sub-section, and three congestion window update algorithms in [TOR_WESTWOOD],
+[TOR_VEGAS], and [TOR_NOLA].
+
+Note that the congestion window update algorithms differ slightly from the
+background tor-dev mails[1,2], due to corrections and improvements. Hence they
+have been given different names than in those two mails. The third algorithm,
+[TOR_NOLA], simply uses the latest BDP estimate directly as its congestion
+window.
 
 These algorithms will be evaluated by running Shadow simulations, to
 help determine parameter ranges, but experimentation on the live network
@@ -200,24 +223,28 @@ when in competition with our current SENDME behavior, as used by real
 network traffic. This experimentation and tuning is detailed in section
 [EVALUATION].
 
-All of these algorithms have rules to update 'cwnd' - the current
-congestion window max. They also change the meaning of 'package_window'
-to be a positive count of the total number of sent cells that are awaiting
-SENDME ack. Thus, 'package_window' is never allowed to exceed 'cwnd', and
-the remaining cells that can be sent at any time is 'cwnd - package_window'.
+All of these algorithms have rules to update 'cwnd' - the current congestion
+window, which starts out at a value controlled by consensus parameter
+'cc_cwnd_init'. The algorithms also keep track of 'inflight', which is a count
+of the number of cells currently not yet acked by a SENDME. The algorithm MUST
+ensure that cells cease being sent if 'cwnd - inflight <= 0'. Note that this
+value CAN become negative in the case where the cwnd is reduced while packets
+are inflight.
 
-C Tor also maintains a 'deliver_window', which it uses to track how many cells
-it has received, in order to send the appropriate number of SENDME acks.
+While these algorithms are in use, updates and checks of the current
+'package_window' field are disabled. Where a 'package_window' value is
+still needed, for example by cell packaging schedulers, 'cwnd - inflight' is
+used (with checks to return 0 in the event of negative values).
 
-  TODO: This 'deliver_window' count can be updated by the other
-        endpoint using the congestion control rules to watch for
-        cheating. Alternatively, it can be simplified just to count
-        the number of cells we get until we send a SENDME.
+The 'deliver_window' field is still used to decide when to send a SENDME. In C
+tor, the deliver window is initially set at 1000, but it never gets below 900,
+because authenticated sendmes (Proposal 289) require that we must send only
+one SENDME at a time, and send it immediately after 100 cells are received.
+This property turns out to be very useful for [BDP_ESTIMATION].
 
 Implementation of different algorithms should be very simple - each
-algorithm should have a different set of package_window update functions
-depending on the selected algorithm, as specified by consensus parameter
-'cc_alg'.
+algorithm should have a different update function depending on the selected algorithm,
+as specified by consensus parameter 'cc_alg'.
 
 For C Tor's current flow control, these functions are defined in sendme.c,
 and are called by relay.c:
@@ -240,275 +267,324 @@ after too many congestion signals. These are deliberate choices that
 simplify the algorithms and also should provide better performance for
 Tor workloads.
 
-  TODO: We may want to experiment with adding revert-to-slow-start back
-        in, but slow start is very expensive in a lot of ways, so let's
-        see if we can avoid falling back into it, if at all possible.
-
-For explanatory reasons, we present the slow start and the AIMD portions of
-each algorithm separately, and then combine the two pieces to show the
-full control algorithm, in each case. The full algorithms are considered
-canonical (sections 3.1.3 and 3.2.3).
-
-Note that these algorithms contain division in this shorthand. Division can be
-elided with relocating those lines to update less often (ie: only once per
-'cwnd', to avoid dividing by 'cwnd' every SENDME).
-
 In all cases, variables in these sections are either consensus parameters
-specified in [CONSENSUS_PARAMETERS], or scoped to the circuit.
+specified in [CONSENSUS_PARAMETERS], or scoped to the circuit. Consensus
+parameters for congestion control are all prefixed by cc_. Everything else
+is circuit-scoped.
 
 
-3.1. Tor Westwood: TCP Westwood using RTT signaling [TOR_WESTWOOD]
+3.1. Estimating Bandwidth-Delay Product [BDP_ESTIMATION]
+
+At a high-level, there are three main ways to estimate the Bandwidth-Delay
+Product: by using the current congestion window and RTT, by using the inflight
+cells and RTT, and by measuring SENDME arrival rate.
+
+All three estimators are updated every SENDME ack arrival.
+
+The SENDME arrival rate is the most accurate way to estimate BDP, but it
+requires averaging over multiple SENDME acks to do so. The congestion window
+and inflight estimates rely on the congestion algorithm more or less correctly
+tracking an approximation of the BDP, and then use current and minimum RTT to
+compensate for overshoot.
+
+The SENDME estimator tends to be accurate after ~3-5 SENDME acks. The cwnd and
+inflight estimators tend to be accurate once the congestion window exceeds
+BDP.
+
+We specify all three because they are all useful in various cases. These cases
+are broken up and combined to form the Piecewise BDP estimator.
+
+The SENDME estimator is smoothed through N-EWMA averaging on these
+estimators[27], to smooth out temporary effects. This is accomplished by using
+an EWMA function with alpha = 2/(N+1):
+
+  N_EWMA = BDP*2/(N+1) + N_EWMA_prev*(N-1)/(N+1).
+
+N is specified in terms of the number of current congestion windows worth of
+SENDMEs to average, via consensus parameter 'cc_ewma_cwnd_cnt'.
+
+The cwnd and inflight estimators also use N-EWMA smoothing in the same way,
+but only smooth the current RTT estimate, not the congestion window value.
+
+3.1.1. SENDME arrival BDP estimation
+
+The most accurate way to estimate BDP is to measure the amount of time between
+SENDME acks. In this period of time, we know that the endpoint successfully
+received 'cc_sendme_inc' cells.
+
+This means that the bandwidth of the circuit is then calculated as:
+
+   BWE = cc_sendme_inc/sendme_ack_timestamp_delta
+
+The bandwidth delay product of the circuit is calculated by multiplying this
+bandwidth estimate by the *minimum* RTT time of the circuit (to avoid counting
+queue time):
+
+   BDP = BWE * RTT_min
+
+In order to minimize the effects of ack compression (aka SENDME responses
+becoming close to one another due to queue delay on the return), we
+maintain a history a full congestion window worth of previous SENDME
+timestamps.
+
+With this, the calculation becomes:
+
+   BWE = (num_sendmes-1) * cc_sendme_inc / num_sendme_timestamp_delta
+   BDP = BWE * RTT_min
+
+Note that because we are counting the number of cells *between* the first
+and last sendme of the congestion window, we must subtract 1 from the number
+of sendmes actually received. Over the time period between the first and last
+sendme of the congestion window, the other endpoint successfully read
+(num_sendmes-1) * cc_sendme_inc cells.
+
+Furthermore, because the timestamps are microseconds, to avoid integer
+truncation, we compute the BDP using multiplication first:
+
+   BDP = (num_sendmes-1) * cc_sendme_inc * RTT_min / num_sendme_timestamp_delta
+
+Note that the SENDME BDP estimation will only work after two (2) SENDME acks
+have been received. Additionally, it tends not to be stable unless at least
+five (5) num_sendme's are used, due to ack compression. This is controlled by
+the 'cc_bwe_min' consensus parameter. Finally, if [CLOCK_HEURISTICS] have
+detected a clock jump or stall, this estimator is not updated.
+
+If all edge connections no longer have data available to send on a circuit
+and all circuit queues have drained without blocking the local orconn, we stop
+updating this BDP estimate and discard old timestamps. However, we retain the
+actual estimator value.
+
+3.1.2. Congestion Window BDP Estimation
+
+Assuming that the current congestion window is at or above the current BDP,
+the bandwidth estimate is the current congestion window size divided by the
+RTT estimate:
+
+   BWE = cwnd / RTT_current_ewma
+
+The BDP estimate is computed by multiplying the Bandwidth estimate by
+the *minimum* circuit latency:
+
+   BDP = BWE * RTT_min
+
+Simplifying:
+
+   BDP = cwnd * RTT_min / RTT_current_ewma
+
+The net effect of this estimation is to correct for any overshoot of
+the cwnd over the actual BDP. It will obviously underestimate BDP if cwnd
+is below BDP.
+
+3.1.3. Inflight BDP Estimation
+
+Similar to the congestion window based estimation, the inflight estimation
+uses the current inflight packet count to derive BDP. It also subtracts local
+circuit queue use from the inflight packet count. This means it will be strictly
+less than or equal to the cwnd version:
+
+   BDP = (inflight - circ.chan_cells.n) * RTT_min / RTT_current_ewma
+
+If all edge connections no longer have data available to send on a circuit
+and all circuit queues have drained without blocking the local orconn, we stop
+updating this BDP estimate, because there are not sufficient inflight cells
+to properly estimate BDP.
+
+3.1.4. Piecewise BDP estimation
+
+The piecewise BDP estimation is used to help respond more quickly in the event
+the local OR connection is blocked, which indicates congestion somewhere along
+the path from the client to the guard (or between Exit and Middle). In this
+case, it takes the minimum of the inflight and SENDME estimators.
+
+When the local OR connection is not blocked, this estimator uses the max of
+the SENDME and cwnd estimator values.
+
+When the SENDME estimator has not gathered enough data, or has cleared its
+estimates based on lack of edge connection use, this estimator uses the
+Congestion Window BDP estimator value.
+
+
+3.2. Tor Westwood: TCP Westwood using RTT signaling [TOR_WESTWOOD]
    http://intronetworks.cs.luc.edu/1/html/newtcps.html#tcp-westwood
    http://nrlweb.cs.ucla.edu/nrlweb/publication/download/99/2001-mobicom-0.pdf
    http://cpham.perso.univ-pau.fr/TCP/ccr_v31.pdf
    https://c3lab.poliba.it/images/d/d7/Westwood_linux.pdf
 
-Recall that TCP Westwood is basically TCP Reno, but it uses RTT to help
-estimate the bandwidth-delay-product (BDP) of the link, and use that for
-"Fast recovery" after a congestion signal arrives.
+Recall that TCP Westwood is basically TCP Reno, but it uses BDP estimates
+for "Fast recovery" after a congestion signal arrives.
 
 We will also be using the RTT congestion signal as per BOOTLEG_RTT_TOR
 here, from the Options mail[1] and Defenestrator paper[3].
 
-This system must keep track of two main measurements, per circuit:
-RTT_min, and RTT_max. Both are measured using the time delta between
-every 'circwindow_inc' relay cells and the SENDME response. The first RTT_min
-can be measured arbitrarily, so long as it is larger than what we would get
-from SENDME.
+This system must keep track of RTT measurements per circuit: RTT_min, RTT_max,
+and RTT_current. These are measured using the time delta between every
+'cc_sendme_inc' relay cells and the SENDME response. The first RTT_min can be
+measured arbitrarily, so long as it is larger than what we would get from
+SENDME.
+
+RTT_current is N-EWMA smoothed over 'cc_ewma_cwnd_cnt' congestion windows
+worth of SENDME acks.
 
 Recall that BOOTLEG_RTT_TOR emits a congestion signal when the current
-RTT falls below some fractional threshold ('rtt_thresh') fraction
+RTT falls below some fractional threshold ('cc_westwood_rtt_thresh') fraction
 between RTT_min and RTT_max. This check is:
-   RTT_current < (1−rtt_thresh)*RTT_min + rtt_thresh*RTT_max
+   RTT_current < (1−cc_westwood_rtt_thresh)*RTT_min
+                  + cc_westwood_rtt_thresh*RTT_max
+
+Additionally, if the local OR connection is blocked at the time of SENDME ack
+arrival, this is treated as an immediate congestion signal.
 
 (We can also optionally use the ECN signal described in
 ideas/xxx-backward-ecn.txt, to exit Slow Start.)
 
-Tor Westwood will require each circuit endpoint to maintain a
-Bandwidth-Delay-Product (BDP) and Bandwidth Estimate (BWE) variable.
+Congestion signals from RTT, blocked OR connections, or ECN are processed only
+once per congestion window. This is achieved through the next_cc_event flag,
+which is initialized to a cwnd worth of SENDME acks, and is decremented
+each ack. Congestion signals are only evaluated when it reaches 0.
 
-The bandwidth estimate is the current congestion window size divided by
-the RTT estimate:
+Note that because the congestion signal threshold of TOR_WESTWOOD is a
+function of RTT_max, and excessive queuing can cause an increase in RTT_max,
+TOR_WESTWOOD may have runaway conditions. Additionally, if stream activity is
+constant, but of a lower bandwidth than the circuit, this will not drive the
+RTT upwards, and this can result in a congestion window that continues to
+increase in the absence of any other concurrent activity.
 
-   BWE = cwnd / RTT_current
+Here is the complete congestion window algorithm for Tor Westwood. This will run
+each time we get a SENDME (aka sendme_process_circuit_level()):
 
-The BDP estimate is computed by multiplying the Bandwidth estimate by
-the circuit latency:
+ # Update acked cells
+ inflight -= cc_sendme_inc
 
-   BDP = BWE * RTT_min
+ if next_cc_event:
+   next_cc_event--
 
-The BDP can also be measured directly using the peak package_window observed
-on the circuit so far (though this may over-estimate if queues build up):
+ # Do not update anything if we detected a clock stall or jump,
+ # as per [CLOCK_HEURISTICS]
+ if clock_stalled_or_jumped:
+   return
 
-   BDP = max(package_window)
-
-This queue delay error may be reduced by using the RTT during the max
-package_window to get BWE, and then computing BDP:
-
-   BWE = max(package_window)/RTT_current    # RTT during max package_window
-   BDP = BWE * RTT_min
-
-  TODO: Different papers on TCP Westwood and TCP Vegas recommend
-        different methods for estimating BWE and BDP. See citations for
-        details, but common options for BWE are 'package_window/RTT_current'
-        or 'circwindow_inc*sendme_arrival_rate'. They also recommend
-        averaging and filtering of the BWE, due to ack compression in
-        inbound queues. We will need to experiment to determine how to
-        best compute the BWE and BDP for Tor circuits.
-
-3.1.1. Tor Westwood: Slow Start
-
-Prior to the first congestion signal, Tor Westwood will update its
-congestion window exponentially, as per Slow Start.
-
-Recall that this first congestion signal can be either BOOTLEG_RTT_TOR's
-RTT threshold signal, or ideas/xxx-backward-ecn.txt cell command signal.
-
-For simplicity, we will just write the BOOTLEG_RTT_TOR check, which
-compares the current RTT measurement to the observed min and max RTT,
-using the consensus parameter 'rtt_thresh'.
-
-This section of the update algorithm is:
-
-   package_window = package_window - circwindow_inc  # For acked cells
-
-   # BOOTLEG_RTT_TOR threshold check:
-   if RTT_current < (1−rtt_thresh)*RTT_min + rtt_thresh*RTT_max:
-      cwnd = cwnd + circwindow_inc                   # Exponential growth
-    else:
-      BDP = BWE*RTT_min                              # Or other BDP estimate
-      cwnd = min(cwnd * cwnd_recovery_m, BDP)
-      in_slow_start = 0
-
-Increasing the congestion window by 100 *more* cells every SENDME allows
-the sender to send 100 *more* cells every 100 cells. Thus, this is an
-exponential function that causes cwnd to double every cwnd cells.
-
-Once a congestion signal is experienced, Slow Start is exited, and the
-Additive-Increase-Multiplicative-Decrease (AIMD) steady-state phase
-begins.
-
-3.1.2. Tor Westwood: Steady State AIMD
-
-After slow start exits, in steady-state, after every SENDME response
-without a congestion signal, the window is updated as:
-
-   package_window = package_window - circwindow_inc  # For acked cells
-   cwnd = cwnd + circwindow_inc/cwnd                 # Linear window growth
-
-This comes out to increasing cwnd by 1, every time cwnd cells are
-successfully sent without a congestion signal occurring. Thus this is
-additive linear growth, not exponential growth.
-
-If there is a congestion signal, cwnd is updated as:
-
-   package_window = package_window - circwindow_inc  # For acked cells
-   cwnd = min(cwnd * cwnd_recovery_m, BDP)           # For window shrink
-
-This is called "Fast Recovery". If you dig into the citations, actual
-TCP Westwood has some additional details for responding to multiple
-packet losses that in some cases can fall back into slow-start, as well
-as some smoothing of the BDP to make up for dropped acks. Tor does not
-need either of these aspects of complexity.
-
-3.1.3. Tor Westwood: Complete SENDME Update Algorithm
-
-Here is the complete congestion window algorithm for Tor Westwood, using
-only RTT signaling.
-
-Recall that 'package_window' is not allowed to exceed 'cwnd' while sending.
-'package_window' must also never become negative - this is a protocol error
-that indicates a malicious endpoint.
-
-This will run each time we get a SENDME (aka sendme_process_circuit_level()):
-
-   in_slow_start = 1                                   # Per-circuit indicator
-
-   Every received SENDME ack, do:
-     package_window = package_window - circwindow_inc  # Update acked cells
-
-     # BOOTLEG_RTT_TOR threshold; can also be BACKWARD_ECN check:
-     if RTT_current < (1−rtt_thresh)*RTT_min + rtt_thresh*RTT_max:
-       if in_slow_start:
-         cwnd = cwnd + circwindow_inc                  # Exponential growth
-       else:
-         cwnd = cwnd + circwindow_inc/cwnd             # Linear growth
+ if next_cc_event == 0:
+   # BOOTLEG_RTT_TOR threshold; can also be BACKWARD_ECN check:
+   if (RTT_current <
+      (100−cc_westwood_rtt_thresh)*RTT_min/100 +
+      cc_westwood_rtt_thresh*RTT_max/100) or orconn_blocked:
+     if in_slow_start:
+       cwnd += cwnd * cc_cwnd_inc_pct_ss             # Exponential growth
      else:
-       BDP = BWE*RTT_min
-       cwnd = min(cwnd * cwnd_recovery_m, BDP)         # Window shrink
-       in_slow_start = 0
+       cwnd = cwnd + cc_cwnd_inc                     # Linear growth
+   else:
+     if cc_westwood_backoff_min:
+       cwnd = min(cwnd * cc_westwood_cwnd_m, BDP)         # Window shrink
+     else:
+       cwnd = max(cwnd * cc_westwood_cwnd_m, BDP)         # Window shrink
+     in_slow_start = 0
 
-3.2. Tor Vegas: TCP Vegas with Aggressive Slow Start [TOR_VEGAS]
+     # Back off RTT_max (in case of runaway RTT_max)
+     RTT_max = RTT_min + cc_westwood_rtt_m * (RTT_max - RTT_min)
+
+   cwnd = MAX(cwnd, cc_circwindow_min)
+   next_cc_event = cwnd / (cc_cwnd_inc_rate * cc_sendme_inc)
+
+
+3.3. Tor Vegas: TCP Vegas with Aggressive Slow Start [TOR_VEGAS]
    http://intronetworks.cs.luc.edu/1/html/newtcps.html#tcp-vegas
    http://pages.cs.wisc.edu/~akella/CS740/F08/740-Papers/BOP94.pdf
    http://www.mathcs.richmond.edu/~lbarnett/cs332/assignments/brakmo_peterson_vegas.pdf
    ftp://ftp.cs.princeton.edu/techreports/2000/628.pdf
 
-TCP Vegas control algorithm makes use of two RTT measurements:
-RTT_current and RTT_min. Like TCP Westwood, it also maintains a
-bandwidth estimate and a BDP estimate, but those can be simplified away
-with algebra.
+TCP Vegas control algorithm estimates the queue lengths at relays by
+subtracting the current BDP estimate from the current congestion window.
 
-The bandwidth estimate is the current congestion window size divided by
-the RTT estimate:
+Assuming the BDP estimate is accurate, any amount by which the congestion
+window exceeds the BDP will cause data to queue.
 
-   BWE = cwnd/RTT_current
-
-The extra queue use along a path can thus be estimated by first
-estimating the path's bandwidth-delay product:
-
-   BDP = BWE*RTT_min
-
-TCP Vegas then estimates the queue use caused by congestion as:
+Thus, Vegas estimates estimates the queue use caused by congestion as:
 
    queue_use = cwnd - BDP
-             = cwnd - cwnd*RTT_min/RTT_current
-             = cwnd * (1 - RTT_min/RTT_current)
 
-So only RTT_min and RTT_current need to be recorded to provide this
-queue_use estimate.
+Original TCP Vegas used a cwnd BDP estimator only. However, because the SENDME
+BDP estimate is more accurate, and because Piecewise BDP allows us to back off
+more when the local OR connection is blocked, we use Piecewise BDP here.
 
-  TODO: This simplification might not hold for some versions of BWE
-        and BDP estimation. See also the [TOR_WESTWOOD] section's TODO
-        and paper citations for both TCP Westwood and TCP Vegas. In
-        particular, see Section 3.5.2 of:
-        http://pages.cs.wisc.edu/~akella/CS740/F08/740-Papers/BOP94.pdf
-        or Section 3.2 of:
-        http://www.mathcs.richmond.edu/~lbarnett/cs332/assignments/brakmo_peterson_vegas.pdf
+For testing, we also parameterize this queue_use calculation as a tunable
+weighted average between the cwnd-based BDP estimate and the piecewise
+estimate (consensus parameter 'cc_vegas_bdp_mix').
 
-3.2.1. Tor Vegas Slow Start
+Additionally, if the local OR connection is blocked at the time of SENDME ack
+arrival, this is treated as an immediate congestion signal.
 
-During slow start, we will increase our window exponentially, so long as
-this queue_use estimate is below the 'vegas_gamma' consensus parameter.
+(We can also optionally use the ECN signal described in
+ideas/xxx-backward-ecn.txt, to exit Slow Start.)
 
-We also re-use the Tor Westwood backoff, upon exit from Slow Start.
+Congestion signals from RTT, blocked OR connections, or ECN are processed only
+once per congestion window. This is achieved through the next_cc_event flag,
+which is initialized to a cwnd worth of SENDME acks, and is decremented
+each ack. Congestion signals are only evaluated when it reaches 0.
 
-Note though that the exit from Slow Start for here does *not* use the
-BOOTLEG_RTT_TOR style RTT threshold, and instead relies on the
-queue_use calculation directly.
+Here is the complete pseudocode for TOR_VEGAS, which is run once per SENDME
+ack:
 
-Tor Vegas slow start can also be exited due to [BACKWARD_ECN] cell
-signal, which is omitted for brevity and clarity.
+  # Update acked cells
+  inflight -= cc_sendme_inc
 
-   package_window = package_window - circwindow_inc  # Ack cells
+  if next_cc_event:
+    next_cc_event--
 
-   if queue_use < vegas_gamma:                       # Vegas RTT check
-     cwnd = cwnd + circwindow_inc                    # Exponential growth
-   else:
-     BDP = BWE*RTT_min                               # Or other BDP estimate
-     cwnd = min(cwnd * cwnd_recovery_m, BDP)         # Westwood backoff
-     in_slow_start = 0
+  # Do not update anything if we detected a clock stall or jump,
+  # as per [CLOCK_HEURISTICS]
+  if clock_stalled_or_jumped:
+    return
 
-3.2.2. Tor Vegas: Steady State Queue Tracking
-
-Recall that TCP Vegas does not use AIMD in the steady state. Because
-TCP Vegas is actually trying to directly control the queue use
-on the path, its updates are additive and subtractive only.
-
-If queue_use drops below a threshold alpha (typically 2-3 packets for
-TCP Vegas, but perhaps double or triple that for our smaller cells),
-then the congestion window is increased. If queue_use exceeds a
-threshold beta (typically 4-6 packets, but again we should probably
-double or triple this), then the congestion window is decreased.
-
-   package_window = package_window - circwindow_inc  # Ack cells
-
-   if queue_use < vegas_alpha:
-     cwnd = cwnd + circwindow_inc/cwnd               # linear growth
-   elif queue_use > vegas_beta:
-     cwnd = cwnd - circwindow_inc/cwnd               # linear backoff
-
-Notice that we only change the window size by a single packet per
-congestion window, rather than by the full delta between current
-queue_use and the target value. This is done because if more than one
-connection jumps to use the available bandwidth at once, excess
-congestion will result (or underutilization).
-
-3.2.3. Tor Vegas: Complete SENDME Update Algorithm
-
-Recall that 'package_window' is not allowed to exceed 'cwnd' while sending.
-'package_window' must also never become negative - this is a protocol error
-that indicates a malicious endpoint.
-
-   in_slow_start = 1                                   # Per-circuit indicator
-
-   Every received SENDME ack:
-     package_window = package_window - circwindow_inc  # Update acked cells
-
-     queue_use = cwnd * (1 - RTT_min/RTT_current)
+  if next_cc_event == 0:
+     if BDP > cwnd:
+       queue_use = 0
+     else:
+       queue_use = cwnd - BDP
 
      if in_slow_start:
-       if queue_use < vegas_gamma:
-         cwnd = cwnd + circwindow_inc                  # Exponential growth
+       if queue_use < cc_vegas_gamma and not orconn_blocked:
+         cwnd = MAX(cwnd * cc_cwnd_inc_pct_ss, BDP)    # Exponential or BDP
        else:
-         BDP = BWE*RTT_min                             # Or other BDP estimate
-         cwnd = min(cwnd * cwnd_recovery_m, BDP)       # Westwood backoff
+         cwnd = BDP
          in_slow_start = 0
      else:
-       if queue_use < vegas_alpha:
-         cwnd = cwnd + circwindow_inc/cwnd             # linear growth
-       elif queue_use > vegas_beta:
-         cwnd = cwnd - circwindow_inc/cwnd             # linear backoff
+       if queue_use > cc_vegas_beta or orconn_blocked:
+         cwnd += cc_cwnd_inc
+       elif queue_use < cc_vegas_alpha:
+         cwnd -= cc_cwnd_inc
+
+     cwnd = MAX(cwnd, cc_circwindow_min)
+     next_cc_event = cwnd / (cc_cwnd_inc_rate * cc_sendme_inc)
+
+
+3.4. Tor NOLA: Direct BDP tracker [TOR_NOLA]
+
+Based on the theory that congestion control should track the BDP,
+the simplest possible congestion control algorithm could just set the
+congestion window directly to its current BDP estimate, every SENDME ack.
+
+Such an algorithm would need to overshoot the BDP slightly, especially in the
+presence of competing algorithms. But other than that, it can be exceedingly
+simple. Like Vegas, but without putting on airs. Just enough strung together.
+
+After meditating on this for a while, it also occurred to me that no one has
+named a congestion control algorithm after New Orleans. We have Reno, Vegas,
+and scores of others. What's up with that?
+
+Here's the pseudocode for TOR_NOLA that runs on every SENDME ack:
+
+  # Do not update anything if we detected a clock stall or jump,
+  # as per [CLOCK_HEURISTICS]
+  if clock_stalled_or_jumped:
+    return
+
+  # If the orconn is blocked, do not overshoot BDP
+  if orconn_blocked:
+    cwnd = BDP
+  else:
+    cwnd = BDP + cc_nola_overshoot
+
+  cwnd = MAX(cwnd, cc_circwindow_min)
 
 
 4. Flow Control [FLOW_CONTROL]
@@ -525,6 +601,12 @@ following functions:
    - circuit_consider_stop_edge_reading()
    - connection_edge_package_raw_inbuf()
    - circuit_resume_edge_reading()
+
+The decision on when a stream is blocked is performed in:
+  - sendme_note_stream_data_packaged()
+  - sendme_stream_data_received()
+  - sendme_connection_edge_consider_sending()
+  - sendme_process_stream_level()
 
 Tor currently maintains separate windows for each stream on a circuit,
 to provide individual stream flow control. Circuit windows are SENDME
@@ -559,50 +641,161 @@ either have to commit to allocating a full congestion window worth
 memory for each stream, or impose a speed limit on our streams.
 
 Hence, we will discard stream windows entirely, and instead use a
-simpler buffer-based design that uses XON/XOFF as a backstop. This will
-allow us to make full use of the circuit congestion window for every
-stream in combination, while still avoiding buffer buildup inside the
-network.
+simpler buffer-based design that uses XON/XOFF to signal when this
+buffer is too large. Additionally, the XON cell will contain advisory
+rate information based on the rate at which that edge connection can
+write data while it has data to write. The other endpoint can rate limit
+sending data for that stream to the rate advertised in the XON, to avoid
+excessive XON/XOFF chatter and sub-optimal behavior.
+
+This will allow us to make full use of the circuit congestion window for
+every stream in combination, while still avoiding buffer buildup inside
+the network.
 
 4.1. Stream Flow Control Without Windows [WINDOWLESS_FLOW]
 
-Each endpoint (client, Exit, or onion service) should send circuit-level
+Each endpoint (client, Exit, or onion service) sends circuit-level
 SENDME acks for all circuit cells as soon as they are decrypted and
-recognized, but *before* delivery to their edge connections. If the edge
-connection is blocked because an application is not reading, data will
-build up in a queue at that endpoint.
+recognized, but *before* delivery to their edge connections.
 
-Three consensus parameters will govern the max length of this queue:
-xoff_client, xoff_exit, and xoff_mobile. These will be used for Tor
-clients, exits, and mobile devices, respectively. These cuttofs will be
-a percentage of current 'cwnd' rather than number of cells. Something
-like 5% of 'cwnd' should be plenty, since these edge connections should
-normally drain *much* faster than Tor itself.
+This means that if the edge connection is blocked because an
+application's SOCKS connection or a destination site's TCP connection is
+not reading, data will build up in a queue at that endpoint,
+specifically in the edge connection's outbuf.
 
-If the length of an application stream queue exceeds the size provided
-in the appropriate consensus parameter, a RELAY_COMMAND_STREAM_XOFF will
-be sent, which instructs the other endpoint to stop sending from that
-edge connection. This XOFF cell can optionally contain any available
-stream data, as well.
+Consensus parameters will govern the length of this queue that
+determines when XON and XOFF cells are sent, as well as when advisory
+XON cells that contain rate information can be sent. These parameters
+are separate for the queue lengths of exits, and of clients/services.
 
-As soon as the queue begins to drain, a RELAY_COMMAND_STREAM_XON will
-sent, which allows the other end to resume reading on that edge
-connection. Because application streams should drain quickly once they
-are active, we will send the XON command as soon as they start draining.
-If the queues fill again, another XOFF will be sent. If this results in
-excessive XOFF/XON flapping and chatter, we will also use consensus
-parameters xon_client, xon_exit, and xon_mobile to optionally specify
-when to send an XON. These parameters will be defined in terms of cells
-below the xoff_* levels, rather than percentage. The XON cells can also
-contain stream data, if any is available.
+(Because clients and services will typically have localhost connections
+for their edges, they will need similar buffering limits. Exits may have
+different properties, since their edges will be remote.)
 
-Tor's OOM killer will be invoked to close any streams whose application
-buffer grows too large, due to memory shortage, or malicious endpoints.
+The trunnel relay cell payload definitions for XON and XOFF are:
 
-Note that no stream buffer should ever grow larger than the xoff level
-plus 'cwnd', unless an endpoint is ignoring XOFF. So,
-'xoff_{client,exit,mobile} + cwnd' should be the hard-close stream
-cutoff, regardless of OOM killer status.
+struct xoff_cell {
+  u8 version IN [0x00];
+}
+
+struct xon_cell {
+  u8 version IN [0x00];
+
+  u32 kbps_ewma;
+}
+
+4.1.1. XON/XOFF behavior
+
+If the length of an edge outbuf queue exceeds the size provided in the
+appropriate client or exit XOFF consensus parameter, a
+RELAY_COMMAND_STREAM_XOFF will be sent, which instructs the other endpoint to
+stop sending from that edge connection.
+
+Once the queue is expected to empty, a RELAY_COMMAND_STREAM_XON will be sent,
+which allows the other end to resume reading on that edge connection. This XON
+also indicates the average rate of queue drain since the XOFF.
+
+Advisory XON cells are also sent whenever the edge connection's drain
+rate changes by more than 'cc_xon_change_pct' percent compared to
+the previously sent XON cell's value.
+
+4.1.2. Edge bandwidth rate advertisement [XON_ADVISORY]
+
+As noted above, the XON cell provides a field to indicate the N_EWMA rate which
+edge connections drain their outgoing buffers.
+
+To compute the drain rate, we maintain a timestamp and a byte count of how many
+bytes were written onto the socket from the connection outbuf.
+
+In order to measure the drain rate of a connection, we need to measure the time
+it took between flushing N bytes on the socket and when the socket is available
+for writing again. In other words, we are measuring the time it took for the
+kernel to send N bytes between the first flush on the socket and the next
+poll() write event.
+
+For example, lets say we just wrote 100 bytes on the socket at time t = 0sec
+and at time t = 2sec the socket becomes writeable again, we then estimate that
+the rate of the socket is 100 / 2sec thus 50B/sec.
+
+To make such measurement, we start the timer by recording a timestamp as soon
+as data begins to accumulate in an edge connection's outbuf, currently 16KB (32
+cells). We use such value for now because Tor write up to 32 cells at once on a
+connection outbuf and so we use this burst of data as an indicator that bytes
+are starting to accumulate.
+
+After 'cc_xon_rate' cells worth of stream data, we use N_EWMA to average this
+rate into a running EWMA average, with N specified by consensus parameter
+'cc_xon_ewma_cnt'. Every EWMA update, the byte count is set to 0 and a new
+timestamp is recorded. In this way, the EWMA counter is averaging N counts of
+'cc_xon_rate' cells worth of bytes each.
+
+If the buffers are non-zero, and we have sent an XON before, and the N_EWMA
+rate has changed more than 'cc_xon_change_pct' since the last XON, we send an
+updated rate. Because the EWMA rate is only updated every 'cc_xon_rate' cells
+worth of bytes, such advisory XON updates can not be sent more frequent than
+this, and should be sent much less often in practice.
+
+When the outbuf completely drains to 0, and has been 0 for 'cc_xon_rate' cells
+worth of data, we double the EWMA rate. We continue to double it while the
+outbuf is 0, every 'cc_xon_rate' cells. The measurement timestamp is also set
+back to 0.
+
+When an XOFF is sent, the EWMA rate is reset to 0, to allow fresh calculation
+upon drain.
+
+If a clock stall or jump is detected by [CLOCK_HEURISTICS], we also
+clear the fields, but do not record them in ewma.
+
+NOTE: Because our timestamps are microseconds, we chose to compute and
+transmit both of these rates as 1000 byte/sec units, as this reduces the
+number of multiplications and divisions and avoids precision loss.
+
+4.1.3. Oomkiller behavior
+
+A malicious client can attempt to exhaust memory in an Exits outbufs, by
+ignoring XOFF and advisory XONs. Implementations MAY choose to close specific
+streams with outbufs that grow too large, but since the exit does not know
+with certainty the client's congestion window, it is non-trival to determine
+the exact upper limit a well-behaved client might send on a blocked stream.
+
+Implementations MUST close the streams with the oldest chunks present in their
+outbufs, while under global memory pressure, until memory pressure is
+relieved.
+
+4.1.4. Sidechannel mitigation
+
+In order to mitigate DropMark attacks[28], both XOFF and advisory XON
+transmission must be restricted. Because DropMark attacks are most severe
+before data is sent, clients MUST ensure that an XOFF does not arrive before
+it has sent the appropriate XOFF limit of bytes on a stream ('cc_xoff_exit'
+for exits, 'cc_xoff_client' for onions).
+
+Clients also SHOULD ensure that advisory XONs do not arrive before the
+minimum of the XOFF limit and 'cc_xon_rate' full cells worth of bytes have
+been transmitted.
+
+Clients SHOULD ensure that advisory XONs do not arrive more frequently than
+every 'cc_xon_rate' cells worth of sent data. Clients also SHOULD ensure than
+XOFFs do not arrive more frequently than every XOFF limit worth of sent data.
+
+Implementations SHOULD close the circuit if these limits are violated on the
+client-side, to detect and resist dropmark attacks[28].
+
+Additionally, because edges no longer use stream SENDME windows, we alter the
+half-closed connection handling to be time based instead of data quantity
+based. Half-closed connections are allowed to receive data up to the larger
+value of the congestion control max_rtt field or the circuit build timeout
+(for onion service circuits, we use twice the circuit build timeout). Any data
+or relay cells after this point are considered invalid data on the circuit.
+
+Recall that all of the dropped cell enforcement in C-Tor is performed by
+accounting data provided through the control port CIRC_BW fields, currently
+enforced only by using the vanguards addon[29].
+
+The C-Tor implementation exposes all of these properties to CIRC_BW for
+vanguards to enforce, but does not enforce them itself. So violations of any
+of these limits do not cause circuit closure unless that addon is used (as
+with the rest of the dropped cell side channel handling in C-Tor).
 
 
 5. System Interactions [SYSTEM_INTERACTIONS]
@@ -710,15 +903,6 @@ delivery of SENDMEs will still allow a full congestion window full of
 data to arrive. This will also require tuning and experimentation, and
 optimum results will vary between simulator and live network.
 
-  TODO: Can we use explicit SENDME sequence number acking to make a
-       connection-resumption conflux, to recover from circuit collapse
-       or client migration? I am having trouble coming up with a design
-       that does not require Exits to maintain a full congestion
-       window full of data as a retransmit buffer in the event of
-       circuit close. Such reconnect activity might require assistance
-       from Guard relays so that they can help clients discover which
-       cells were sent vs lost.
-
 
 6. Performance Evaluation [EVALUATION]
 
@@ -727,71 +911,146 @@ tune to ensure optimal behavior.
 
 6.1. Congestion Signal Experiments
 
-Our first experiments will be to conduct client-side experiments to
+Our first experiments were to conduct client-side experiments to
 determine how stable the RTT measurements of circuits are across the
 live Tor network, to determine if we need more frequent SENDMEs, and/or
 need to use any RTT smoothing or averaging.
 
-Once we have a reliable way to measure RTT, we will need to test the
-reliability and accuracy of the Bandwidth Estimation (BWE) and
-Bandwidth-Delay-Product (BDP) measurements that are required for
-[TOR_WESTWOOD] and [TOR_VEGAS]. These experiments can be conducted in
-Shadow, with precise network topologies for which actual bandwidth and
-latency (and thus BWE and BDP) are known parameters.  We should use the
-most accurate form of these estimators from Shadow experimentation to
-run some client tests with custom Exits on the live network, to check
-for high variability in these estimates, discrepancy with client
-application throughput and application latency, and other surprises.
+These experiments were performed using onion service clients and services on
+the live Tor network. From these experiments, we tuned the RTT and BDP
+estimators, and arrived at reasonable values for EWMA smoothing and the
+minimum number of SENDME acks required to estimate BDP.
 
-Care will need to be taken to increase or alter Tor's circwindow during
-these experiments in Shadow and on the custom Exits, so that the default
-of 1000 does not impose an artificial ceiling on circuit bandwidth.
+Additionally, we specified that the algorithms maintain previous congestion
+window estimates in the event that a circuit goes idle, rather than revert to
+slow start. We experimented with intermittent idle/active live onion clients
+to make sure that this behavior is acceptable, and it appeared to be.
+
+In Shadow experimentation, the primary thing to test will be if the OR conn on
+Exit relays blocks too frequently when under load, thus causing excessive
+congestion signals, and overuse of the Inflight BDP estimator as opposed
+to SENDME or CWND BDP. It may also be the case that this behavior is optimal,
+even if it does happen.
+
+Finally, we should check small variations in the EWMA smoothing and minimum BDP ack
+counts in Shadow experimentation, to check for high variability in these
+estimates, and other surprises.
 
 6.2. Congestion Algorithm Experiments
 
-In order to evaluate performance of congestion control algorithms, we
-will need to implement [TOR_WESTWOOD], [TOR_VEGAS], and also variants of
-those without the Westwood BDP fast recovery backoff. We will need to
+In order to evaluate performance of congestion control algorithms, we will
+need to implement [TOR_WESTWOOD], [TOR_VEGAS], and [TOR_NOLA]. We will need to
 simulate their use in the Shadow Tor network simulator.
 
 Simulation runs will need to evaluate performance on networks that use
 only one algorithm, as well as on networks that run a combinations of
 algorithms - particularly each type of congestion control in combination
-with Tor's current flow control. If Tor's current flow control is too
-aggressive, we can experiment with kneecapping these legacy flow control
-Tor clients by setting a low 'circwindow' consensus parameter for them.
+with Tor's current flow control. Depending upon the number of current
+flow control clients, more aggressive parameters of these algorithms may
+need to be set, but this will result in additional queueing as well as
+sub-optimal behavior once all clients upgrade.
+
+In particular, during live onion service testing, we noticed that these
+algorithms required particularly agressive default values to compete against
+a network full of current clients. As more clients upgrade, we may be able
+to lower these defaults. We should get a good idea of what values we can
+choose at what upgrade point, from mixed Shadow simulation.
+
+If Tor's current flow control is so aggressive that it causes probelems with
+any amount of remaining old clients, we can experiment with kneecapping these
+legacy flow control Tor clients by setting a low 'circwindow' consensus
+parameter for them. This will allow us to set more reasonable parameter
+values, without waiting for all clients to upgrade.
 
 Because custom congestion control can be deployed by any Exit or onion
-service that desires better service, we will need to be particularly
-careful about how congestion control algorithms interact with rogue
-implementations that more aggressively increase their window sizes.
-During these adversarial-style experiments, we must verify that cheaters
-do not get better service, and that Tor's circuit OOM killer properly
-closes circuits that seriously abuse the congestion control algorithm,
-as per [SECURITY_ANALYSIS].
+service that desires better service, we will need to be particularly careful
+about how congestion control algorithms interact with rogue implementations
+that more aggressively increase their window sizes.  During these
+adversarial-style experiments, we must verify that cheaters do not get
+better service, and that Tor's circuit OOM killer properly closes circuits
+that seriously abuse the congestion control algorithm, as per
+[SECURITY_ANALYSIS]. This may requiring tuning 'circ_max_cell_queue_size',
+and 'CircuitPriorityHalflifeMsec'.
 
-Finally, we should determine if the [BACKWARD_ECN] cell_t.command
-congestion signal is enough of an optimization to be worth the
-complexity, especially if it is only used once, to exit slow start. This
-can be determined in Shadow.
+Additionally, we will need to experiment with reducing the cell queue limits
+on OR conns before they are blocked (OR_CONN_HIGHWATER), and study the
+interaction of that with treating the or conn block as a congestion signal.
+
+Finally, we will need to monitor our Shadow experiments for evidence of ack
+compression, which can cause the BDP estimator to over-estimate the congestion
+window. We will instrument our Shadow simulations to alert if they discover
+excessive congestion window values, and tweak 'cc_bwe_min' and
+'cc_sendme_inc' appropriately. We can set the 'cc_cwnd_max' parameter value
+to low values (eg: ~2000 or so) to watch for evidence of this in Shadow, and
+log. Similarly, we should watch for evidence that the 'cc_cwnd_min' parameter
+value is rarely hit in Shadow, as this indicates that the cwnd may be too
+small to measure BDP (for cwnd less than 'cc_sendme_inc'*'cc_bwe_min').
 
 6.3. Flow Control Algorithm Experiments
 
-We will need to tune the xoff_* consensus parameters to minimize the
-amount of edge connection buffering as well as XON/XOFF chatter for
-Exits. This can be done in simulation, but will require fine-tuning on
-the live network.
+Flow control only applies when the edges outside of Tor (SOCKS application,
+onion service application, or TCP destination site) are *slower* than Tor's
+congestion window. This typically means that the application is either
+suspended or reading too slow off its SOCKS connection, or the TCP destination
+site itself is bandwidth throttled on its downstream.
 
-Relays will need to report these statistics in extra-info descriptor,
-to help with monitoring the live network conditions.
+To examine these properties, we will perform live onion service testing, where
+curl is used to download a large file. We will test no rate limit, and
+verify that XON/XOFF was never sent. We then suspend this download, verify
+that an XOFF is sent, and transmission stops. Upon resuming this download, the
+download rate should return to normal. We will also use curl's --limit-rate
+option, to exercise that the flow control properly measures the drain rate and
+limits the buffering in the outbuf, modulo kernel socket and localhost TCP
+buffering.
+
+However, flow control can also get triggered at Exits in a situation where
+either TCP fairness issues or Tor's mainloop does not properly allocate
+enough capacity to edge uploads, causing them to be rate limited below the
+circuit's congestion window, even though the TCP destination actually has
+sufficient downstream capacity.
+
+Exits are also most vulnerable to the buffer bloat caused by such uploads,
+since there may be many uploads active at once.
+
+To study this, we will run shadow simulations. Because Shadow does *not*
+rate limit its tgen TCP endpoints, and only rate limits the relays
+themselves, if *any* XON/XOFF activity happens in Shadow *at all*, it is
+evidence that such fairness issues can ocurr.
+
+Just in case Shadow does not have sufficient edge activity to trigger such
+emergent behavior, when congestion control is enabled on the live network, we
+will also need to instrument a live exit, to verify that XON/XOFF is not
+happening frequently on it. Relays may also report these statistics in
+extra-info descriptor, to help with monitoring the live network conditions, but
+this might also require aggregation or minimization.
+
+If excessive XOFF/XON activity happens at Exits, we will need to investigate
+tuning the libevent mainloop to prioritize edge writes over orconn writes.
+Additionally, we can lower 'cc_xoff_exit'. Linux Exits can also lower the
+'net.ipv[46].tcp_wmem' sysctl value, to reduce the amount of kernel socket
+buffering they do on such streams, which will improve XON/XOFF responsiveness
+and reduce memory usage.
 
 6.4. Performance Metrics [EVALUATION_METRICS]
 
-Because congestion control will affect so many aspects of performance,
-from throughput to RTT, to load balancing, queue length, overload, and
-other failure conditions, the full set of performance metrics will be
-required:
-  https://trac.torproject.org/projects/tor/wiki/org/roadmaps/CoreTor/PerformanceMetrics
+The primary metrics that we will be using to measure the effectiveness
+of congestion control in simulation are TTFB/RTT, throughput, and utilization.
+
+We will calibrate the Shadow simulator so that it has similar CDFs for all of
+these metrics as the live network, without using congestion control.
+
+Then, we will want to inspect CDFs of these three metrics for various
+congestion control algorithms and parameters. 
+
+The live network testing will also spot-check performance characteristics of
+a couple algorithm and parameter sets, to ensure we see similar results as
+Shadow.
+
+On the live network, because congestion control will affect so many aspects of
+performance, from throughput to RTT, to load balancing, queue length,
+overload, and other failure conditions, the full set of performance metrics
+will be required, to check for any emergent behaviors:
+  https://gitlab.torproject.org/legacy/trac/-/wikis/org/roadmaps/CoreTor/PerformanceMetrics
 
 We will also need to monitor network health for relay queue lengths,
 relay overload, and other signs of network stress (and particularly the
@@ -803,88 +1062,434 @@ During Shadow simulation, we will determine reasonable default
 parameters for our consensus parameters for each algorithm. We will then
 re-run these tuning experiments on the live Tor network, as described
 in:
-  https://trac.torproject.org/projects/tor/wiki/org/roadmaps/CoreTor/PerformanceExperiments
+  https://gitlab.torproject.org/tpo/core/team/-/wikis/NetworkTeam/Sponsor61/PerformanceExperiments
 
-The following list is the complete set of network consensus parameters
-referenced in this proposal, sorted roughly in order of importance (most
-important to tune first):
+6.5.1. Parameters common to all algorithms
+
+These are sorted in order of importance to tune, most important first.
 
   cc_alg:
     - Description:
           Specifies which congestion control algorithm clients should
           use, as an integer.
-    - Range: [0,2]  (0=fixed, 1=Westwood, 2=Vegas)
+    - Range: [0,3]  (0=fixed, 1=Westwood, 2=Vegas, 3=NOLA)
     - Default: 2
+    - Tuning Values: [2,3]
+    - Tuning Notes:
+           These algorithms need to be tested against percentages of current
+           fixed alg client competition, in Shadow. Their optimal parameter
+           values, and even the optimal algorithm itself, will likely depend
+           upon how much fixed sendme traffic is in competition. See the
+           algorithm-specific parameters for additional tuning notes.
 
-  cwnd_recovery_m:
-    - Description: Specifies how much to reduce the congestion
-                   window after a congestion signal, as a fraction of
-                   100.
-    - Range: [0, 100]
-    - Default: 70
+  cc_bwe_min:
+    - Description:
+          The minimum number of SENDME acks to average over in order to
+          estimate bandwidth (and thus BDP).
+    - Range: [2, 20]
+    - Default: 5
+    - Tuning Values: 4-10
+    - Tuning Notes:
+           The lower this value is, the sooner we can get an estimate of
+           the true BDP of a circuit. Low values may lead to massive
+           over-estimation, due to ack compression. However, if this
+           value is above the number of acks that fit in cc_cwnd_init, then
+           we won't get a BDP estimate within the first use of the circuit.
+           Additionally, if this value is above the number of acks that
+           fit in cc_cwnd_min, we may not be able to estimate BDP
+           when the congestion window is small. If we need small congestion
+           windows, we should also lower cc_sendme_inc, which will get us more
+           frequent acks with less data.
 
-  circwindow:
-    - Description: Initial congestion window for legacy Tor clients
-    - Range: [1, 1000]
-    - Default: 1000 (reduced if legacy Tor clients compete unfairly)
+  cc_sendme_inc:
+    - Description: Specifies how many cells a SENDME acks
+    - Range: [1, 5000]
+    - Default: 50
+    - Tuning Values: 25,33,50
+    - Tuning Notes:
+           Increasing this increases overhead, but also increases BDP
+           estimation accuracy. Since we only use circuit-level sendmes,
+           and the old code sent sendmes at both every 50 cells, and every
+           100, we can set this as low as 33 to have the same amount of
+           overhead.
 
-  circwindow_cc:
+  cc_cwnd_init:
     - Description: Initial congestion window for new congestion
                    control Tor clients. This can be set much higher
                    than TCP, since actual TCP to the guard will prevent
                    buffer bloat issues at local routers.
-    - Range: [1, 10000]
-    - Default: 10-1000
+    - Range: [100, 10000]
+    - Default: 500
+    - Tuning Values: 150,200,250,500
+    - Tuning Notes:
+           Higher initial congestion windows allow the algorithms to
+           measure initial BDP more accurately, but will lead to queue bursts
+           and latency.  Ultimately, the ICW should be set to approximately
+           'cc_bwe_min'*'cc_sendme_inc', but the presence of competing
+           fixed window clients may require higher values.
 
-  rtt_thresh:
+  cc_cwnd_min:
+    - Description: The minimum allowed cwnd.
+    - Range: [cc_sendme_inc, 1000]
+    - Tuning Values: [100, 150, 200]
+    - Tuning Notes:
+           If the cwnd falls below cc_sendme_inc, connections can't send
+           enough data to get any acks, and will stall. If it falls below
+           cc_bwe_min*cc_sendme_inc, connections can't use SENDME BDP
+           estimates. Likely we want to set this around
+           cc_bwe_min*cc_sendme_inc, but no lower than cc_sendme_inc.
+
+  cc_cwnd_max:
+    - Description: The maximum allowed cwnd.
+    - Range: [cc_sendme_inc, INT32_MAX]
+    - Default: INT32_MAX
+    - Tuning Values: [5000, 10000, 20000]
+    - Tuning Notes:
+       If cc_bwe_min is set too low, the BDP estimator may over-estimate the
+       congestion window in the presence of large queues, due to SENDME ack
+       compression. Once all clients have upgraded to congestion control,
+       queues large enough to cause ack compression should become rare. This
+       parameter exists primarily to verify this in Shadow, but we preserve it
+       as a consensus parameter for emergency use in the live network, as well.
+
+  circwindow:
+    - Description: Initial congestion window for legacy Tor clients
+    - Range: [100, 1000]
+    - Default: 1000
+    - Tuning Values: 100,200,500,1000
+    - Tuning Notes:
+           If the above congestion algorithms are not optimal until an
+           unreasonably high percentge of clients upgrade, we can reduce
+           the performance of ossified legacy clients by reducing their
+           circuit windows. This will allow old clients to continue to
+           operate without impacting optimal network behavior.
+
+  cc_cwnd_inc_rate:
+    - Description: How often we update our congestion window, per cwnd worth
+                   of packets
+    - Range: [1, 250]
+    - Default: 1
+    - Tuning Values: [1,2,5,10]
+    - Tuning Notes:
+           Congestion control theory says that the congestion window should
+           only be updated once every cwnd worth of packets. We may find it
+           better to update more frequently, but this is probably unlikely
+           to help a great deal.
+
+  cc_ewma_cwnd_cnt:
+    - Description: This specifies the N in N-EWMA smoothing of RTT and BDP
+                   estimation. It allows us to average these values over 1
+                   or more congestion windows.
+    - Range: [1, 100]
+    - Default: 2
+    - Tuning Values: [1,2,3]
+    - Tuning Notes:
+           Smoothing our estimates reduces the effects of ack compression and
+           other ephemeral network hiccups; changing this much is unlikely
+           to have a huge impact on performance.
+
+  cc_cwnd_inc:
+    - Description: How much to increment the congestion window by during
+                   steady state, every cwnd.
+    - Range: [1, 1000]
+    - Default: 50
+    - Tuning Values: 25,50,100
+    - Tuning Notes:
+           We are unlikely to need to tune this much, but it might be worth
+           trying a couple values.
+
+  cc_cwnd_inc_pct_ss:
+    - Description: Percentage of the current congestion window to increment
+                   by during slow start, every cwnd.
+    - Range: [10, 300]
+    - Default: 100
+    - Tuning Values: 50,100,200
+    - Tuning Notes:
+           On the current live network, the algorithms tended to exit slow
+           start early, so we did not exercise this much. This may not be the
+           case in Shadow, or once clients upgrade to the new algorithms.
+
+  cc_bdp_alg:
+    - Description: The BDP estimation algorithm to use.
+    - Range: [0,7]
+    - Default: 7 (Piecewise EWMA)
+    - Tuning Notes:
+           We don't expect to need to tune this.
+
+6.5.2. Westwood parameters
+
+  Westwood has runaway conditions. Because the congestion signal threshold of
+  TOR_WESTWOOD is a function of RTT_max, excessive queuing can cause an
+  increase in RTT_max. Additionally, if stream activity is constant, but of
+  a lower bandwidth than the circuit, this will not drive the RTT upwards,
+  and this can result in a congestion window that continues to increase in the
+  absence of any other concurrent activity.
+
+  For these reasons, we are unlikely to spend much time deeply investigating
+  Westwood in Shadow, beyond a simulaton or two to check these behaviors.
+
+  cc_westwood_rtt_thresh:
     - Description:
               Specifies the cutoff for BOOTLEG_RTT_TOR to deliver
               congestion signal, as fixed point representation
               divided by 1000.
     - Range: [1, 1000]
-    - Default: 230
+    - Default: 33
+    - Tuning Values: [20, 33, 40, 50]
+    - Tuning Notes:
+          The Defenestrator paper set this at 23, but did not justify it. We
+          may need to raise it to compete with current fixed window SENDME.
 
-  vegas_alpha
-  vegas_beta
-  vegas_gamma
+  cc_westwood_cwnd_m:
+    - Description: Specifies how much to reduce the congestion
+                   window after a congestion signal, as a fraction of
+                   100.
+    - Range: [0, 100]
+    - Default: 75
+    - Tuning Values: [50, 66, 75]
+    - Tuning Notes:
+           Congestion control theory started out using 50 here, and then
+           decided 70-75 was better.
+
+  cc_westwood_min_backoff:
+    - Description: If 1, take the min of BDP estimate and westwood backoff.
+                   If 0, take the max of BDP estimate and westwood backoff.
+    - Range: [0, 1]
+    - Default: 0
+    - Tuning Notes:
+           This parameter can make the westwood backoff less agressive, if
+           need be. We're unlikely to need it, though.
+
+  cc_westwood_rtt_m:
+    - Description: Specifies a backoff percent of RTT_max, upon receipt of
+                   a congestion signal.
+    - Range: [50, 100]
+    - Default: 100
+    - Tuning Notes:
+           Westwood technically has a runaway condition where congestion can
+           cause RTT_max to grow, which increases the congestion threshhold.
+           This has not yet been observed, but because it is possible, we
+           include this parameter.
+
+6.5.3. Vegas Parameters
+
+  cc_vegas_alpha:
+  cc_vegas_beta:
+  cc_vegas_gamma:
     - Description: These parameters govern the number of cells
                    that [TOR_VEGAS] can detect in queue before reacting.
     - Range: [1, 1000]
-    - Defaults: 6,12,12
+    - Defaults: 6*cc_sendme_inc for gamma and beta; 3*cc_sendme_inc for alpha
+    - Tuning Notes:
+           The amount of queued cells that Vegas should tolerate is heavily
+           dependent upon competing congestion control algorithms. The specified
+           defaults are necessary to compete against current fixed SENDME traffic,
+           but are much larger than neccessary otherwise. As the number of
+           clients using fixed windows is reduced (or circwindow is lowered), we
+           can reduce these parameters, which will result in less overall queuing
+           and congestion on the network.
 
-  circwindow_inc:
-    - Description: Specifies how many cells a SENDME acks
-    - Range: [1, 5000]
+  cc_vegas_bdp_mix:
+    - Description: This parameter allows us to specify a weighted percent
+                   average between the cwnd BDP estimator and the piecewise
+                   estimator.
+    - Range: [0, 100]
+    - Default: 0 (use 100% Piecewise EWMA)
+    - Tuning Notes:
+           The original Vegas literature specified the CWND estimator, but
+           the Piecewise estimator is very likely more suited for our use
+           case. This parameter allows us to average them. We're unlikely to
+           need it.
+
+6.5.4. NOLA Parameters
+
+  cc_nola_overshoot:
+    - Description: The number of cells to add to the BDP estimator to obtain
+                   the NOLA cwnd.
+    - Range: [0, 1000]
     - Default: 100
+    - Tuning Values: 0, 50, 100, 150, 200
+    - Tuning Notes:
+            In order to compete against current fixed sendme, and to ensure
+            that the congestion window has an opportunity to grow, we must
+            set the cwnd above the current BDP estimate. How much above will
+            be a function of competing traffic. It may also turn out that
+            absent any more agressive competition, we do not need to overshoot
+            the BDP estimate.
 
-  min_queue_target:
-    - Description: How long in milliseconds can a cell spend in
-      a relay's queues before we declare its circuit congested?
+6.5.5. Flow Control Parameters
+
+  As with previous sections, the parameters in this section are sorted with
+  the parameters that are most impportant to tune, first.
+
+  These parameters have been tuned using onion services. The defaults are
+  believed to be good.
+
+  cc_xoff_client
+  cc_xoff_exit
+    - Description: Specifies the outbuf length, in relay cell multiples,
+                   before we send an XOFF.
     - Range: [1, 10000]
-    - Default: 10
+    - Default: 500
+    - Tuning Values: [500, 1000]
+    - Tuning Notes:
+        This threshold plus the sender's cwnd must be greater than the
+        cc_xon_rate value, or a rate cannot be computed. Unfortunately,
+        unless it is sent, the receiver does not know the cwnd. Therefore,
+        this value should always be higher than cc_xon_rate minus 
+        'cc_cwnd_min' (100) minus the xon threshhold value (0).
 
-  queue_interval:
-    - Description: How long in milliseconds must cells exceed
-      'min_queue_target' queue delay before we actually send a
-      congestion signal?
-    - Range: [1, 10000]
-    - Default: 200
+  cc_xon_rate
+    - Description: Specifies how many full packed cells of bytes must arrive
+                   before we can compute a rate, as well as how often we can
+                   send XONs.
+    - Range: [1, 5000]
+    - Default: 500
+    - Tuning Values: [500, 1000]
+    - Tuning Notes:
+        Setting this high will prevent excessive XONs, as well as reduce
+        side channel potential, but it will delay response to queuing.
+        and will hinder our ability to detect rate changes. However, low
+        values will also reduce our ability to accurately measure drain
+        rate. This value should always be lower than 'cc_xoff_*' +
+        'cc_cwnd_min', so that a rate can be computed solely from the outbuf
+        plus inflight data.
 
-  xoff_client
-  xoff_mobile
-  xoff_exit
-    - Description: Specifies the stream queue size as a percentage of
-                   'cwnd' at an endpoint before an XOFF is sent.
+ cc_xon_change_pct
+    - Description: Specifies how much the edge drain rate can change before
+                   we send another advisory cell.
     - Range: [1, 100]
-    - Default: 5
+    - Default: 25
+    - Tuning values: [25, 50, 75]
+    - Tuning Notes:
+        Sending advisory updates due to a rate change may help us avoid
+        hitting the XOFF limit, but it may also not help much unless we
+        are already above the advise limit.
 
-  xon_client
-  xon_mobile
-  xon_exit
-    - Description: Specifies the how many cells below xoff_* before
-                   an XON is sent from an endpoint.
-    - Range: [1, 10000000]
-    - Default: 10000
+  cc_xon_ewma_cnt
+    - Description: Specifies the N in the N_EWMA of rates.
+    - Range: [2, 100]
+    - Default: 2
+    - Tuning values: [2, 3, 5]
+    - Tuning Notes:
+        Setting this higher will smooth over changes in the rate field,
+        and thus avoid XONs, but will reduce our reactivity to rate changes.
+ 
+
+6.5.6. External Performance Parameters to Tune
+
+  The following parameters are from other areas of Tor, but tuning them
+  will improve congestion control performance. They are again sorted
+  by most important to tune, first.
+
+  cbtquantile
+    - Description: Specifies the percentage cutoff for the circuit build
+                   timeout mechanism.
+    - Range: [60, 80]
+    - Default: 80    
+    - Tuning Values: [70, 75, 80]
+    - Tuning Notes:
+       The circuit build timeout code causes Tor to use only the fastest
+       'cbtquantile' percentage of paths to build through the network.
+       Lowering this value will help avoid congested relays, and improve
+       latency.
+
+  CircuitPriorityHalflifeMsec
+    - Description: The CircEWMA half-life specifies the time period after
+                   which the cell count on a circuit is halved. This allows
+                   circuits to regain their priority if they stop being bursty.
+    - Range: [1, INT32_MAX]
+    - Default: 30000
+    - Tuning Values: [5000, 15000, 30000, 60000]
+    - Tuning Notes:
+       When we last tuned this, it was before KIST[31], so previous values may
+       have little relevance to today. According to the CircEWMA paper[30], values
+       that are too small will fail to differentiate bulk circuits from interactive
+       ones, and values that are too large will allow new bulk circuits to keep
+       priority over interactive circuits for too long. The paper does say
+       that the system was not overly sensitive to specific values, though.
+
+  CircuitPriorityTickSecs
+    - Description: This specifies how often in seconds we readjust circuit
+                   priority based on their EWMA.
+    - Range: [1, 600]
+    - Default: 10
+    - Tuning Values: [1, 5, 10]
+    - Tuning Notes:
+        Even less is known about the optimal value for this parameter. At a
+        guess, it should be more often than the half-life. Changing it also
+        influences the half-life decay, though, at least according to the
+        CircEWMA paper[30].
+
+  KISTSchedRunInterval
+    - If 0, KIST is disabled. (We should also test KIST disabled)
+
+
+6.5.7. External Memory Reduction Parameters to Tune
+
+  The following parameters are from other areas of Tor, but tuning them
+  will reduce memory utilization in relays. They are again sorted by most
+  important to tune, first.
+
+  circ_max_cell_queue_size
+    - Description: Specifies the minimum number of cells that are allowed
+                   to accumulate in a relay queue before closing the circuit.
+    - Range: [1000, INT32_MAX]
+    - Default: 50000
+    - Tuning Values: [1000, 2500, 5000]
+    - Tuning Notes:
+       Once all clients have upgraded to congestion control, relay circuit
+       queues should be minimized. We should minimize this value, as any
+       high amounts of queueing is a likely violator of the algorithm.
+
+  cellq_low
+  cellq_high
+    - Description: Specifies the number of cells that can build up in
+                   a circuit's queue for delivery onto a channel (from edges)
+                   before we either block or unblock reading from streams
+                   attached to that circuit.
+    - Range: [1, 1000]
+    - Default: low=10, high=256
+    - Tuning Values: low=[0, 2, 4, 8]; high=[16, 32, 64]
+    - Tuning Notes:
+        When data arrives from edges into Tor, it gets packaged up into cells
+        and then delivered to the cell queue, and from there is dequeued and
+        sent on a channel. If the channel has blocked (see below params), then
+        this queue grows until the high watermark, at which point Tor stops
+        reading on all edges associated with a circuit, and a congestion
+        signal is delivered to that circuit. At 256 cells, this is ~130k of
+        data for *every* circuit, which is far more than Tor can write in a
+        channel outbuf. Lowering this will reduce latency, reduce memory
+        usage, and improve responsiveness to congestion. However, if it is
+        too low, we may incur additional mainloop invocations, which are
+        expensive. We will need to trace or monitor epoll() invocations in
+        Shadow or on a Tor exit to verify that low values do not lead to
+        more mainloop invocations.
+
+  orconn_high
+  orconn_low
+    - Description: Specifies the number of bytes that can be held in an
+                   orconn's outbuf before we block or unblock the orconn.
+    - Range: [509, INT32_MAX]
+    - Default: low=16k, high=32k
+    - Tuning Notes:
+        When the orconn's outbuf is above the high watermark, cells begin
+        to accumulate in the cell queue as opposed to being added to the
+        outbuf. It may make sense to lower this to be more in-line with the
+        cellq values above. Also note that the low watermark is only used by
+        the vanilla scheduler, so tuning it may be relevant when we test with
+        KIST disabled. Just like the cell queue, if this is set lower, congestion
+        signals will arrive sooner to congestion control when orconns become
+        blocked, and less memory will occupy queues. It will also reduce latency.
+        Note that if this is too low, we may not fill TLS records, and we may
+        incur excessive epoll()/mainloop invocations. Tuning this is likely
+        less beneficial than tuning the above cell_queue, unless KIST is
+        disabled.
+
+  MaxMemInQueues
+    - Should be possible to set much lower, similarly to help with
+      OOM conditions due to protocol violation. Unfortunately, this
+      is just a torrc, and a bad one at that.
 
 
 7. Protocol format specifications [PROTOCOL_SPEC]
@@ -894,12 +1499,12 @@ important to tune first):
 7.1. Circuit window handshake format
 
    TODO: We need to specify a way to communicate the currently seen
-         circwindow_inc consensus parameter to the other endpoint,
+         cc_sendme_inc consensus parameter to the other endpoint,
          due to consensus sync delay. Probably during the CREATE
          onionskin (and RELAY_COMMAND_EXTEND).
    TODO: We probably want stricter rules on the range of values
          for the per-circuit negotiation - something like
-         it has to be between [circwindow_inc/2, 2*circwindow_inc].
+         it has to be between [cc_sendme_inc/2, 2*cc_sendme_inc].
          That way, we can limit weird per-circuit values, but still
          allow us to change the consensus value in increments.
 
@@ -1053,7 +1658,114 @@ also be used as a side channel. So we must limit its use to a couple of
 cells per circuit, at most.
   https://blog.torproject.org/tor-security-advisory-relay-early-traffic-confirmation-attack
 
-9. Acknowledgements
+9. Onion Services
+
+Onion service requires us to advertise the protocol version and congestion
+control parameters in a different way since the end points do not know each
+other like a client knows all the relays and what they support.
+
+To address this, this is done in two parts. First, the service needs to
+advertise to the world that it supports congestion control. This is done
+through a new line in the descriptor, see section 9.1 below.
+
+Second, the client needs to inform the service that it wants to use congestion
+control on the rendezvous circuit and with wich parameters. This is done
+through the INTRODUCE cell as an extension, see section 9.2 below.
+
+9.1. Descriptor
+
+We propose to add a new line to advertise the flow control protocol version:
+
+  "flow-control" SP version-number NL
+
+    The "version-number" value is the same as the protocol version FlowCtrl
+    that relay advertises which is defined earlier in this proposal. Current
+    value can only be "2".
+
+Clients that are able to parse this line and know the protocol version can then
+send in the INTRODUCE1 cell congestion control parameters that they would like
+to use which is detailed in the next section.
+
+This line MUST be removed from the descriptor if the consensus disables
+congestion control by setting "cc_alg=0". In other words, a service should only
+advertise its flow control version if congestion control is enabled network
+wide.
+
+9.2 INTRODUCE cell extension
+
+We propose a new extension to the INTRODUCE cell which can be used to send
+congestion control parameters down to the service. It is important to mention
+that this is an extension to be used in the encrypted setion of the cell and
+not its readable section by the introduction point.
+
+If used, it needs to be encoded within the N_EXTENSIONS field of the ENCRYPTED
+section of the INTRODUCE1 cell defined in rend-spec-v3.txt section 3.3. The
+content is defined as follow:
+
+  EXT_FIELD_TYPE:
+
+    [01] -- Congestion Control Parameters.
+
+    If this flag is set, the extension should be used by the service to learn
+    what are the congestion control parameters to use on the rendezvous
+    circuit.
+
+  EXT_FIELD content format is:
+
+    N_PARAMS          [1 byte]
+    N_PARAMS times:
+      PARAM_TYPE      [1 byte]
+      PARAM_VALUE     [8 byte]
+
+    The PARAM_TYPE possible values are:
+
+      [01] -- Newest protocol version supported
+              The newest protocol version that the client supports.
+
+      [02] -- SENDME increment
+              The initial SENDME increment that should be used by both end points
+              when using congestion control.
+
+    The PARAM_VALUE size is 8 bytes in order to accomodate 64bit values. It
+    MUST match the specified limits for the following PARAM_TYPE:
+
+      [01] -- Min: 2, Max: 255
+      [02] -- Min: 1, Max: 5000 (same as "cc_sendme_inc")
+
+9.3 Protocol Flow
+
+First, the client reads the "flow-control" line in the descriptor and gets the
+maximum value from what it supports and the service supports. As an example, if
+the client supports 2-3-4 and the service supports 2-3, then 3 is chosen.
+
+It then sends that value along its desired cc_sendme_inc value in the
+INTRODUCE1 cell in the extension.
+
+The service will then validate that is does support version 3 and that the
+parameter cc_sendme_inc is within range of the protocol. Congestion control is
+then applied to the rendezvous circuit.
+
+9.4 Circuit Behavior
+
+If the extension is not found in the cell, the service MUST not use congestion
+control on the rendezvous circuit.
+
+Any invalid values received in the extension should result in closing the
+introduction circuit and thus not continuing the rendezvous process. An invalid
+value is either if the value is not supported or out of the defined range.
+
+9.5 Security Considerations
+
+Advertising a new line in a descriptor does leak that a service is running at
+least a certain tor version. We believe that this is an acceptable risk in
+order to be able for service to take advantage of congestion control. Once a
+new tor stable is released, we hope that most service upgrades and thus
+everyone looks the same again.
+
+The new extension is located in the encrypted part of the INTRODUCE1 cell and
+thus the introduction point can't learn its content.
+
+10. Acknowledgements
 
 Immense thanks to Toke Høiland-Jørgensen for considerable input into all
 aspects of the TCP congestion control background material for this proposal,
@@ -1061,7 +1773,7 @@ as well as review of our versions of the algorithms.
 
 
 
-10. [CITATIONS]
+11. [CITATIONS]
 
 1. Options for Congestion Control in Tor-Like Networks.
    https://lists.torproject.org/pipermail/tor-dev/2020-January/014140.html
@@ -1133,7 +1845,25 @@ as well as review of our versions of the algorithms.
     https://github.com/torproject/tor/blob/master/doc/HACKING/CircuitPaddingDevelopment.md
 
 24. Plans for Tor Live Network Performance Experiments
-    https://trac.torproject.org/projects/tor/wiki/org/roadmaps/CoreTor/PerformanceExperiments
+    https://gitlab.torproject.org/tpo/core/team/-/wikis/NetworkTeam/Sponsor61/PerformanceExperiments
 
 25. Tor Performance Metrics for Live Network Tuning
-    https://trac.torproject.org/projects/tor/wiki/org/roadmaps/CoreTor/PerformanceMetrics
+    https://gitlab.torproject.org/legacy/trac/-/wikis/org/roadmaps/CoreTor/PerformanceMetrics
+
+26. Bandwidth-Delay Product
+    https://en.wikipedia.org/wiki/Bandwidth-delay_product
+
+27. Exponentially Weighted Moving Average
+    https://corporatefinanceinstitute.com/resources/knowledge/trading-investing/exponentially-weighted-moving-average-ewma/
+
+28. Dropping on the Edge
+    https://www.petsymposium.org/2018/files/papers/issue2/popets-2018-0011.pdf
+
+29. https://github.com/mikeperry-tor/vanguards/blob/master/README_TECHNICAL.md#the-bandguards-subsystem
+
+30. An Improved Algorithm for Tor Circuit Scheduling.
+    https://www.cypherpunks.ca/~iang/pubs/ewma-ccs.pdf
+
+31. KIST: Kernel-Informed Socket Transport for Tor
+    https://matt.traudt.xyz/static/papers/kist-tops2018.pdf
+

@@ -2,6 +2,30 @@
                         Tor Directory List Format
                          Tim Wilson-Brown (teor)
 
+Table of Contents
+
+    1. Scope and Preliminaries
+        1.1. Format Overview
+        1.2. Acknowledgements
+        1.3. Format Versions
+        1.4. Future Plans
+    2. Format Details
+        2.1. Nonterminals
+        2.2. List Header
+            2.2.1. List Header Format
+        2.3. List Generation
+            2.3.1. List Generation Format
+        2.4. Directory Entry
+            2.4.1. Directory Entry Format
+    3. Usage Considerations
+        3.1. Caching
+        3.2. Retrieving Directory Information
+        3.3. Fallback Reliability
+    A.1. Sample Data
+        A.1.1. Sample Fallback List Header
+        A.1.2. Sample Fallback List Generation
+        A.1.3. Sample Fallback Entries
+
 1. Scope and Preliminaries
 
    This document describes the format of Tor's directory lists, which are
@@ -334,7 +358,7 @@
        recent Tor versions.
 
        weight was removed in version 2.0.0, but is documented because it
-       may be of interest to libraries implementing Tor's fallaback
+       may be of interest to libraries implementing Tor's fallback
        behaviour.
 
      DQUOTE SP+ key_value DQUOTE SP* NL
@@ -433,7 +457,7 @@
    Libraries SHOULD consider the potential load on the authorities, and
    whether other sources can meet their needs.
 
-   Libraries that require high-uptime availablility of Tor directory
+   Libraries that require high-uptime availability of Tor directory
    information should investigate the following options:
 
      * OnionOO: https://metrics.torproject.org/onionoo.html

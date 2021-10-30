@@ -19,6 +19,48 @@ of their choices.
       "OPTIONAL" in this document are to be interpreted as described in
       RFC 2119.
 
+Tables of Contents
+
+    1. General operation
+        1.1. Terminology
+        1.2. A relay's bandwidth
+    2. Building circuits
+        2.1. When we build
+            2.1.0. We don't build circuits until we have enough directory info
+            2.1.1. Clients build circuits preemptively
+            2.1.2. Clients build circuits on demand
+            2.1.3. Relays build circuits for testing reachability and bandwidth
+            2.1.4. Hidden-service circuits
+            2.1.5. Rate limiting of failed circuits
+            2.1.6. When to tear down circuits
+        2.2. Path selection and constraints
+            2.2.1. Choosing an exit
+            2.2.2. User configuration
+        2.3. Cannibalizing circuits
+        2.4. Learning when to give up ("timeout") on circuit construction
+            2.4.1 Distribution choice and parameter estimation
+            2.4.2. How much data to record
+            2.4.3. How to record timeouts
+            2.4.4. Detecting Changing Network Conditions
+            2.4.5. Consensus parameters governing behavior
+            2.4.6. Consensus parameters governing behavior
+        2.5. Handling failure
+    3. Attaching streams to circuits
+    4. Hidden-service related circuits
+    5. Guard nodes
+        5.1. How consensus bandwidth weights factor into entry guard selection
+    6. Server descriptor purposes
+    7. Detecting route manipulation by Guard nodes (Path Bias)
+        7.1. Measuring path construction success rates
+        7.2. Measuring path usage success rates
+        7.3. Scaling success counts
+        7.4. Parametrization
+        7.5. Known barriers to enforcement
+    X. Old notes
+    X.1. Do we actually do this?
+    X.2. A thing we could do to deal with reachability.
+    X.3. Some stuff that worries me about entry guards. 2006 Jun, Nickm.
+
 1. General operation
 
    Tor begins building circuits as soon as it has enough directory
@@ -90,7 +132,7 @@ of their choices.
    is unknown (usually its target IP), but we believe the path probably
    supports the request according to the rules given below.
 
-1.1. A relay's bandwidth
+1.2. A relay's bandwidth
 
    Old versions of Tor did not report bandwidths in network status
    documents, so clients had to learn them from the routers' advertised
@@ -141,8 +183,25 @@ of their choices.
         (F is as above.)
 
       * Having a descriptor for every one of the first
-        NUM_GUARDS_TO_USE guards among our primary guards. (see
+        NUM_USABLE_PRIMARY_GUARDS guards among our primary guards. (see
         guard-spec.txt)
+
+   We define the "fraction of bandwidth-weighted paths" as the product of
+   these three fractions.
+
+      * The fraction of descriptors that we have for nodes with the Guard
+        flag, weighted by their bandwidth for the guard position.
+      * The fraction of descriptors that we have for all nodes,
+        weighted by their bandwidth for the middle position.
+      * The fraction of descriptors that we have for nodes with the Exit
+        flag, weighted by their bandwidth for the exit position.
+
+   If the consensus has zero weighted bandwidth for a given kind of
+   relay (Guard, Middle, or Exit), Tor instead uses the fraction of relays
+   for which it has the descriptor (not weighted by bandwidth at all).
+
+   If the consensus lists zero exit-flagged relays, Tor instead uses the
+   fraction of middle relays.
 
 
 2.1.1. Clients build circuits preemptively
@@ -188,6 +247,11 @@ of their choices.
    might be supported by a pending or built circuit. For internal
    circuits, we pick an arbitrary acceptable path, repeating as needed.
 
+   Clients consider a circuit to become "dirty" as soon as a stream is
+   attached to it, or some other request is performed over the circuit.
+   If a circuit has been "dirty" for at least MaxCircuitDirtiness seconds,
+   new circuits may not be attached to it.
+
    In some cases we can reuse an already established circuit if it's
    clean; see Section 2.3 (cannibalizing circuits) for details.
 
@@ -225,8 +289,16 @@ of their choices.
 
 2.1.6. When to tear down circuits
 
-   XXXX
+   Clients should tear down circuits (in general) only when those circuits
+   have no streams on them.  Additionally, clients should tear-down
+   stream-less circuits only under one of the following conditions:
 
+     - The circuit has never had a stream attached, and it was created too
+       long in the past (based on CircuitsAvailableTimeout or
+       cbtlearntimeout, depending on timeout estimate status).
+
+     - The circuit is dirty (has had a stream attached), and it has been
+       dirty for at least MaxCircuitDirtiness.
 
 2.2. Path selection and constraints
 
@@ -383,6 +455,11 @@ of their choices.
    good fit over the long term, clients store 1000 most recent circuit build
    times in a circular array.
 
+   These build times only include the times required to build three-hop
+   circuits, and the times required to build the first three hops of circuits
+   with more than three hops.  Circuits of fewer than three hops are not
+   recorded, and hops past the third are not recorded.
+   
    The Tor client should build test circuits at a rate of one every 'cbttestfreq'
    (10 seconds) until 'cbtmincircs' (100 circuits) are built, with a maximum of
    'cbtmaxopencircs' (default: 10) circuits open at once. This allows a fresh
@@ -390,9 +467,9 @@ of their choices.
    or network change (see section 2.4.5 below).
 
    Timeouts are stored on disk in a histogram of 10ms bin width, the same
-   width used to calculate the Xm value above. This histogram must be shuffled
-   after being read from disk, to preserve a proper expiration of old values
-   after restart.
+   width used to calculate the Xm value above. The timeouts recorded in the
+   histogram must be shuffled after being read from disk, to preserve a
+   proper expiration of old values after restart.
 
    Thus, some build time resolution is lost during restart. Implementations may
    choose a different persistence mechanism than this histogram, but be aware
@@ -403,7 +480,7 @@ of their choices.
    Once 'cbtmincircs' build times are recorded, Tor clients update the
    distribution parameters and recompute the timeout every circuit completion
    (though see section 2.4.5 for when to pause and reset timeout due to
-   network change or connectivity loss).
+   too many circuits timing out).
 
    Tor clients calculate the parameters for a Pareto distribution fitting the
    data using the maximum likelihood estimator. For derivation, see:
@@ -414,8 +491,11 @@ of their choices.
    used directly as Xm.
 
    Instead of using the mode of discrete build times directly, Tor clients
-   compute the Xm parameter using the weighted average of the the midpoints
+   compute the Xm parameter using the weighted average of the midpoints
    of the 'cbtnummodes' (10) most frequently occurring 10ms histogram bins.
+   Ties are broken in favor of earlier bins (that is, in favor of bins
+   corresponding to shorter build times).
+
    (The use of 10 modes was found to minimize error from the selected
    cbtquantile, with 10ms bins for quantiles 60-80, compared to many other
    heuristics).
@@ -431,7 +511,7 @@ of their choices.
 
    All times below Xm are counted as having the Xm value via the MAX(),
    because in Pareto estimators, Xm is supposed to be the lowest value.
-   However, since clients use mode averaging to estimatre Xm, there can be
+   However, since clients use mode averaging to estimate Xm, there can be
    values below our Xm. Effectively, the Pareto estimator then treats that
    everything smaller than Xm happened at Xm. One can also see that if
    clients did not do this, alpha could underflow to become negative, which
@@ -445,7 +525,8 @@ of their choices.
 
       F(q) = Xm/((1.0-q)^(1.0/alpha))
 
-   Thus, clients obtain their circuit build timeout by computing:
+   Thus, clients obtain the circuit build timeout for 3-hop circuits by
+   computing:
 
      timeout_ms = F(0.8)    # 'cbtquantile' == 0.8
 
@@ -464,6 +545,27 @@ of their choices.
      timeout_ms = MIN(timeout_ms, max_observed_timeout)
      close_ms = MAX(MIN(close_ms, 2*max_observed_timeout), 'cbtinitialtimeout')
 
+2.4.3. Calculating timeouts thresholds for circuits of different lengths
+
+   The timeout_ms and close_ms estimates above are good only for 3-hop
+   circuits, since only 3-hop circuits are recorded in the list of build
+   times.
+
+   To calculate the appropriate timeouts and close timeouts for circuits of
+   other lengths, the client multiples the timeout_ms and close_ms values
+   by a scaling factor determined by the number of communication hops
+   needed to build their circuits:
+
+   timeout_ms[hops=n] = timeout_ms * Actions(N) / Actions(3)
+
+   close_ms[hops=n] = close_ms * Actions(N) / Actions(3)
+
+       where Actions(N) = N * (N + 1) / 2.
+
+   To calculate timeouts for operations other than circuit building,
+   the client should add X to Actions(N) for every round-trip communication
+   required with the Xth hop.
+
 2.4.4. How to record timeouts
 
    Pareto estimators begin to lose their accuracy if the tail is omitted.
@@ -475,7 +577,7 @@ of their choices.
    to the point 'cbtclosequantile' (default 99) on the Pareto curve, or 60
    seconds, whichever is greater.
 
-   The actual completion times for these measurements circuits should be
+   The actual completion times for these measurement circuits should be
    recorded.
 
    Implementations should completely abandon a circuit and ignore the circuit
@@ -488,12 +590,6 @@ of their choices.
    Tor clients attempt to detect both network connectivity loss and drastic
    changes in the timeout characteristics.
 
-   Clients assume that they have had network connectivity loss if a circuit
-   times out and have received no cells or TLS handshakes since that
-   circuit began. Clients then temporarily stop counting timeouts until
-   network activity resumes (ie: until a TLS handshake completes or a cell
-   arrives at the client).
-
    To detect changing network conditions, clients keep a history of
    the timeout or non-timeout status of the past 'cbtrecentcount' circuits
    (20 circuits) that successfully completed at least one hop. If more than
@@ -501,7 +597,12 @@ of their choices.
    resets the timeout to 'cbtinitialtimeout' (60 seconds), and then begins
    recomputing the timeout.
 
-   If the timeout was already 60 or higher, the client doubles the timeout.
+   If the timeout was already at least `cbtinitialtimeout`,
+   the client doubles the timeout.
+
+   The records here (of how many circuits succeeded or failed among the most
+   recent 'cbrrecentcount') are not stored as persistent state.  On reload,
+   we start with a new, empty state.
 
 2.4.6. Consensus parameters governing behavior
 
@@ -583,8 +684,11 @@ of their choices.
         Default: 60000
         Min: Value of cbtmintimeout
         Max: 2147483647 (INT32_MAX)
-        Effect: This is the timeout value to use before computing a timeout,
-                in milliseconds.
+        Effect: This is the timeout value to use before we have enough data
+                to compute a timeout, in milliseconds.  If we do not have
+                enough data to compute a timeout estimate (see cbtmincircs),
+                then we use this interval both for the close timeout and the
+                abandon timeout.
 
       cbtlearntimeout
         Default: 180

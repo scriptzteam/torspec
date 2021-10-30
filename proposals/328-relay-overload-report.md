@@ -26,9 +26,9 @@ We propose that relays start collecting several metrics (see section 2)
 reflecting their loads from different component of tor.
 
 Then, we propose that 3 new lines be added to the extra-info document (see
-dir-spec.txt, section 2.1.2) if only the overload case arrise.
+dir-spec.txt, section 2.1.2) if only the overload case arises.
 
-This following describes a series of metrics to collect but more might come in
+The following describes a series of metrics to collect but more might come in
 the future and thus this is not an exhaustive list.
 
 # 1.1. General Overload
@@ -44,14 +44,14 @@ state" which can be one or many of the following load metrics:
    - Control port overload (too many messages queued)
 
 The format of the overloaded line added in the extra-info document is as
-follow:
+follows:
 
 ```
 "overload-general" SP version SP YYYY-MM-DD HH:MM:SS NL
    [At most once.]
 ```
 
-The timestamp is when at least one metrics was detected. It should always be
+The timestamp is when at least one metric was detected. It should always be
 at the hour and thus, as an example, "2020-01-10 13:00:00" is an expected
 timestamp. Because this is a binary state, if the line is present, we consider
 that it was hit at the very least once somewhere between the provided
@@ -87,7 +87,7 @@ and BandwidthBurst found in the torrc configuration file.
 
 The "{read|write}-overload-count" are the counts of how many times the reported
 limits of burst/rate were exhausted and thus the maximum between the read and
-write count occurances. To make the counter more meaningful and to avoid
+write count occurrences. To make the counter more meaningful and to avoid
 multiple connections saturating the counter when a relay is overloaded, we only
 increment it once a minute.
 
@@ -142,10 +142,10 @@ component identified by a label (see list below). To make sense, this should
 be visualized with the rate() function.
 
 Possible LABELs for which the OOM was triggered:
-  - `cell`: Circuit cell queue
-  - `dns`: DNS resolution cache
-  - `geoip`: GeoIP cache
-  - `hsdir`: Onion service descriptors
+  - `subsys=cell`: Circuit cell queue
+  - `subsys=dns`: DNS resolution cache
+  - `subsys=geoip`: GeoIP cache
+  - `subsys=hsdir`: Onion service descriptors
 
 ## 2.2 Onionskin Queues
 
@@ -161,8 +161,10 @@ tor_load_onionskin_total{<LABEL>} <NUM>
 ```
 
 Possible LABELs are:
-  - `processed`: Indicating how many were processed.
-  - `dropped`: Indicating how many were dropped due to load.
+  - `type=<handshake_type>`: Type of handshake of that onionskins.
+      * Possible values: `ntor`, `tap`, `fast`
+  - `action=processed`: Indicating how many were processed.
+  - `action=dropped`: Indicating how many were dropped due to load.
 
 ## 2.3 File Descriptor Exhaustion
 
@@ -177,7 +179,8 @@ tor_load_fd_total{<LABEL>} <NUM>
 ```
 
 Possible LABELs are:
-  - `remaining`: How many file descriptors remains that is can be opened.
+  - `state=total`: Maximum number of file descriptors allowed open
+  - `state=opened`: How many file descriptors are opened.
 
 Note: since tor does track that value in order to reserve a block for critical
 port such as the Control Port, that value can easily be exported.
@@ -195,7 +198,8 @@ tor_load_socket_total{<LABEL>} <NUM>
 ```
 
 Possible LABELs are:
-  - `outbound`: Sockets used for outbound connections.
+  - `state=total`: Maximum number of sockets allowed open
+  - `state=opened`: How sockets are opened.
 
 ## 2.5 Connection Bucket Limit
 
@@ -210,5 +214,5 @@ tor_load_global_rate_limit_reached_total{<LABEL>} <NUM>
 ```
 
 Possible LABELs are:
-  - `read`: Read side of the global rate limit bucket.
-  - `write`: Write side of the global rate limit bucket.
+  - `side=read`: Read side of the global rate limit bucket.
+  - `side=write`: Write side of the global rate limit bucket.

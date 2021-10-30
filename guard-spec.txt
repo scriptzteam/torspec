@@ -6,6 +6,37 @@
                               Ola Bini
                            Nick Mathewson
 
+Table of Contents
+
+    1. Introduction and motivation
+    2. State instances
+    3. Circuit Creation, Entry Guard Selection (1000 foot view)
+        3.1 Path selection
+            3.1.1 Managing entry guards
+            3.1.2 Middle and exit node selection
+        3.2 Circuit Building
+    4. The algorithm.
+        4.0. The guards listed in the current consensus. [Section:GUARDS]
+        4.1. The Sampled Guard Set. [Section:SAMPLED]
+        4.2. The Usable Sample [Section:FILTERED]
+        4.3. The confirmed-guard list. [Section:CONFIRMED]
+        4.4. The Primary guards [Section:PRIMARY]
+        4.5. Retrying guards. [Section:RETRYING]
+        4.6. Selecting guards for circuits. [Section:SELECTING]
+        4.7. When a circuit fails. [Section:ON_FAIL]
+        4.8. When a circuit succeeds [Section:ON_SUCCESS]
+        4.9. Updating the list of waiting circuits [Section:UPDATE_WAITING]
+        4.10. Whenever we get a new consensus. [Section:ON_CONSENSUS]
+        4.11. Deciding whether to generate a new circuit.
+        4.12. When we are missing descriptors.
+    A. Appendices
+        A.0. Acknowledgements
+        A.1. Parameters with suggested values. [Section:PARAM_VALS]
+        A.2. Random values [Section:RANDOM]
+        A.3. Why not a sliding scale of primaryness? [Section:CVP]
+        A.4. Controller changes
+        A.5. Persistent state format
+
 1. Introduction and motivation
 
   Tor uses entry guards to prevent an attacker who controls some
@@ -390,11 +421,15 @@
   {CONFIRMED_GUARDS} and {FILTERED_GUARDS}, and take the first
   {N_PRIMARY_GUARDS} elements.  If there are fewer than
   {N_PRIMARY_GUARDS} elements, append additional elements to
-  PRIMARY_GUARDS chosen from ({FILTERED_GUARDS} - {CONFIRMED_GUARDS}) in
-  sample order.
+  PRIMARY_GUARDS chosen from ({FILTERED_GUARDS} - {CONFIRMED_GUARDS}),
+  ordered in "sample order" (that is, by {ADDED_ON_DATE}).
 
   Once an element has been added to {PRIMARY_GUARDS}, we do not remove it
   until it is replaced by some element from {CONFIRMED_GUARDS}.
+  That is: if a non-primary guard becomes confirmed and not every primary
+  guard is confirmed, then the list of primary guards list is regenerated,
+  first from the confirmed guards (as before), and then from any
+  non-confirmed primary guards.
 
   Note that {PRIMARY_GUARDS} do not have to be in
   {USABLE_FILTERED_GUARDS}: they might be unreachable.
@@ -684,15 +719,15 @@ A.1.  Parameters with suggested values. [Section:PARAM_VALS]
    {param:N_PRIMARY_GUARDS} -- 3
 
    {param:PRIMARY_GUARDS_RETRY_SCHED}
-      -- every 30 minutes for the first 6 hours.
-      -- every 2 hours for the next 3.75 days.
-      -- every 4 hours for the next 3 days.
+      -- every 10 minutes for the first six hours,
+      -- every 90 minutes for the next 90 hours,
+      -- every 4 hours for the next 3 days,
       -- every 9 hours thereafter.
 
-   {param:GUARDS_RETRY_SCHED} -- 1 hour
-      -- every hour for the first 6 hours.
-      -- every 4 hours for the next 3.75 days.
-      -- every 18 hours for the next 3 days.
+   {param:GUARDS_RETRY_SCHED} --
+      -- every hour for the first six hours,
+      -- every 4 hours for the 90 hours,
+      -- every 18 hours for the next 3 days,
       -- every 36 hours thereafter.
 
    {param:INTERNET_LIKELY_DOWN_INTERVAL} -- 10 minutes
@@ -771,7 +806,7 @@ A.3. Why not a sliding scale of primaryness? [Section:CVP]
         simple to make to the code after we implement the simpler
         version of the algorithm described above.
 
-A.3. Controller changes
+A.4. Controller changes
 
    We will add to control-spec.txt a new possible circuit state, GUARD_WAIT,
    that can be given as part of circuit events and GETINFO responses about
@@ -779,7 +814,7 @@ A.3. Controller changes
    but we will not use it because a circuit with a better guard might
    become built too.
 
-A.4. Persistent state format
+A.5. Persistent state format
 
    The persistent state format doesn't need to be part of this
    specification, since different implementations can do it

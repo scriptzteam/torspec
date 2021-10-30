@@ -4,6 +4,77 @@
                               Roger Dingledine
                                Nick Mathewson
 
+Table of Contents
+
+    0. Preliminaries
+        0.1. Notation and encoding
+        0.2. Security parameters
+        0.3. Ciphers
+        0.4. A bad hybrid encryption algorithm, for legacy purposes
+    1. System overview
+        1.1. Keys and names
+    2. Connections
+        2.1. Picking TLS ciphersuites
+        2.2. TLS security considerations
+    3. Cell Packet format
+    4. Negotiating and initializing connections
+        4.1. Negotiating versions with VERSIONS cells
+        4.2. CERTS cells
+        4.3. AUTH_CHALLENGE cells
+        4.4. AUTHENTICATE cells
+            4.4.1. Link authentication type 1: RSA-SHA256-TLSSecret
+            4.4.2. Link authentication type 3: Ed25519-SHA256-RFC5705
+        4.5. NETINFO cells
+    5. Circuit management
+        5.1. CREATE and CREATED cells
+            5.1.1. Choosing circuit IDs in create cells
+            5.1.2. EXTEND and EXTENDED cells
+            5.1.3. The "TAP" handshake
+            5.1.4. The "ntor" handshake
+            5.1.5. CREATE_FAST/CREATED_FAST cells
+        5.2. Setting circuit keys
+            5.2.1. KDF-TOR
+            5.2.2. KDF-RFC5869
+        5.3. Creating circuits
+            5.3.1. Canonical connections
+        5.4. Tearing down circuits
+        5.5. Routing relay cells
+            5.5.1. Circuit ID Checks
+            5.5.2. Forward Direction
+                5.5.2.1. Routing from the Origin
+                5.5.2.2. Relaying Forward at Onion Routers
+            5.5.3. Backward Direction
+                5.5.3.1. Relaying Backward at Onion Routers
+            5.5.4. Routing to the Origin
+        5.6. Handling relay_early cells
+    6. Application connections and stream management
+        6.1. Relay cells
+        6.2. Opening streams and transferring data
+            6.2.1. Opening a directory stream
+        6.3. Closing streams
+        6.4. Remote hostname lookup
+    7. Flow control
+        7.1. Link throttling
+        7.2. Link padding
+        7.3. Circuit-level flow control
+            7.3.1. SENDME Cell Format
+        7.4. Stream-level flow control
+    8. Handling resource exhaustion
+        8.1. Memory exhaustion
+    9. Subprotocol versioning
+        9.1. "Link"
+        9.2. "LinkAuth"
+        9.3. "Relay"
+        9.4. "HSIntro"
+        9.5. "HSRend"
+        9.6. "HSDir"
+        9.7. "DirCache"
+        9.8. "Desc"
+        9.9. "Microdesc"
+        9.10. "Cons"
+        9.11. "Padding"
+        9.12. "FlowCtrl"
+
 Note: This document aims to specify Tor as currently implemented, though it
 may take it a little time to become fully up to date. Future versions of Tor
 may implement improved protocols, and compatibility is not guaranteed.
@@ -873,12 +944,12 @@ see tor-design.pdf.
       TIME       (Timestamp)                     [4 bytes]
       OTHERADDR  (Other OR's address)            [variable]
          ATYPE   (Address type)                  [1 byte]
-         ALEN    (Adress length)                 [1 byte]
+         ALEN    (Address length)                [1 byte]
          AVAL    (Address value in NBO)          [ALEN bytes]
       NMYADDR    (Number of this OR's addresses) [1 byte]
         NMYADDR times:
           ATYPE   (Address type)                 [1 byte]
-          ALEN    (Adress length)                [1 byte]
+          ALEN    (Address length)               [1 byte]
           AVAL    (Address value in NBO))        [ALEN bytes]
 
    Recognized address types (ATYPE) are:
@@ -887,11 +958,13 @@ see tor-design.pdf.
      [06] IPv6.
 
    ALEN MUST be 4 when ATYPE is 0x04 (IPv4) and 16 when ATYPE is 0x06
-   (IPv6).
+   (IPv6).  If the ALEN value is wrong for the given ATYPE value, then
+   the provided address should be ignored.
 
    The timestamp is a big-endian unsigned integer number of seconds
    since the Unix epoch. Implementations MUST ignore unexpected bytes
-   at the end of the cell.
+   at the end of the cell.  Clients SHOULD send "0" as their timestamp, to
+   avoid fingerprinting.
 
    Implementations MAY use the timestamp value to help decide if their
    clocks are skewed.  Initiators MAY use "other OR's address" to help
@@ -1068,6 +1141,10 @@ see tor-design.pdf.
    identity, and receives a request for that Ed25519 ID and a
    different RSA identity, it SHOULD NOT attempt to make another
    connection: it should just fail and DESTROY the circuit.
+
+   The client MAY include multiple IPv4 or IPv6 link specifiers in an
+   EXTEND cell; current OR implementations only consider the first
+   of each type.
 
    After checking relay identities, extending ORs generate a
    CREATE/CREATE2 cell from the contents of the EXTEND/EXTEND2 cell.
@@ -1687,6 +1764,9 @@ see tor-design.pdf.
    dotted-quad format, or an IPv6 address surrounded by square brackets;
    and where PORT is a decimal integer between 1 and 65535, inclusive.
 
+   The ADDRPORT string SHOULD be sent in lower case, to avoid
+   fingerprinting.  Implementations MUST accept strings in any case.
+
    The FLAGS value has one or more of the following bits set, where
    "bit 1" is the LSB of the 32-bit value, and "bit 32" is the MSB.
    (Remember that all values in Tor are big-endian (see 0.1.1 above), so
@@ -1769,7 +1849,7 @@ see tor-design.pdf.
    and relays MUST ignore the payload.
 
    In response to a RELAY_BEGIN_DIR cell, relays respond either with a
-   RELAY_CONNECTED cell on succcess, or a RELAY_END cell on failure. They
+   RELAY_CONNECTED cell on success, or a RELAY_END cell on failure. They
    MUST send a RELAY_CONNECTED cell all-zero payload, and clients MUST ignore
    the payload.
 
@@ -1808,25 +1888,31 @@ see tor-design.pdf.
       14 -- REASON_NOTDIRECTORY   (Client sent RELAY_BEGIN_DIR to a
                                    non-directory relay.)
 
+   [*] Older versions of Tor also send this reason when connections are
+       reset.
 
-   For most reasons, the format is:
+   OPs and ORs MUST accept reasons not on the above list, since future
+   versions of Tor may provide more fine-grained reasons.
+
+   For most reasons, the format of RELAY_END is:
 
       Reason                      [1 byte]
 
-   For REASON_EXITPOLICY, the format is:
+   For REASON_EXITPOLICY, the format of RELAY_END is:
 
       Reason                      [1 byte]
       IPv4 or IPv6 address        [4 bytes or 16 bytes]
       TTL                         [4 bytes]
 
-   OPs and ORs MUST accept reasons not on the above list, since future
-   versions of Tor may provide more fine-grained reasons.
+   (If the TTL is absent, it should be treated as if it were 0xffffffff.
+   If the address is absent or is the wrong length, the RELAY_END message
+   should be processed anyway.)
 
    Tors SHOULD NOT send any reason except REASON_MISC for a stream that they
    have originated.
 
-   [*] Older versions of Tor also send this reason when connections are
-       reset.
+   Implementations SHOULD accept empty RELAY_END messages, and treat them
+   as if they specified REASON_MISC.
 
    Upon receiving a RELAY_END cell, the recipient may be sure that no further
    cells will arrive on that stream, and can treat such cells as a protocol
@@ -1950,9 +2036,11 @@ see tor-design.pdf.
    field is either 1 (stop padding) or 2 (start padding). For the start
    padding command, a pair of timeout values specifying a low and a high
    range bounds for randomized padding timeouts may be specified as unsigned
-   integer values in milliseconds. The ito_low_ms field must not be lower than
-   the current consensus parameter value for nf_ito_low (default: 1500).
-   ito_high_ms must be greater than ito_low_ms.
+   integer values in milliseconds. The ito_low_ms field should not be lower
+   than the current consensus parameter value for nf_ito_low (default:
+   1500).  The ito_high_ms field should not be lower than ito_low_ms.
+   (If any party receives an out-of-range value, they clamp it so
+   that it is in-range.)
 
    For more details on padding behavior, see padding-spec.txt.
 
@@ -2064,6 +2152,8 @@ see tor-design.pdf.
 
 
 8.1. Memory exhaustion.
+
+   (See also dos-spec.md.)
 
    If RAM becomes low, an OR should begin destroying circuits until
    more memory is free again.  We recommend the following algorithm:
